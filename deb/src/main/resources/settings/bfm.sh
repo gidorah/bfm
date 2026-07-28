@@ -1,92 +1,130 @@
 #!/bin/bash
-export SERVICE_NAME=bfm
-export PATH_TO_JAR=/etc/bfm/bfmwatcher/bfm-app.jar
-export PATH_TO_APP_PROP=/etc/bfm/bfmwatcher/application.properties
 
-case $1 in
-start)
-        echo "Starting $SERVICE_NAME ..."
-        export PS_10=$(ps -ef|grep bfmwatcher|awk 'NR==1{print $10}')
-        if [ "$PS_10" = "$PATH_TO_JAR" ]
-        then
-                export PID=$(ps -ef|grep bfmwatcher |awk 'NR==1{print $2}')
-                echo "$SERVICE_NAME is already running on $PID pid number"
-        else
-                if [ -f "/etc/bfm/bfmwatcher/bfm.log" ]
-                then
-                        echo "old logfile archiving..."
-                        mv /etc/bfm/bfmwatcher/bfm.log /etc/bfm/bfmwatcher/bfm_$(date +"%Y-%m-%d_%H-%M-%S").log
-                fi
-                nohup java -jar $PATH_TO_JAR -Dspring.config.location=$PATH_TO_APP_PROP >> /etc/bfm/bfmwatcher/bfm.log 2>&1 &
-        
-                export PS_10=$(ps -ef|grep bfmwatcher |awk 'NR==1{print $10}')
-                echo $PS_10
-                echo $PATH_TO_JAR
-                if [ "$PS_10" = "$PATH_TO_JAR" ]
-                then
-                        export PID2=$(ps -ef|grep bfmwatcher |awk 'NR==1{print $2}')
-                        echo "$SERVICE_NAME is started on $PID2 pid number"
-                else
-                        echo "$SERVICE_NAME could not start ..."
-                fi
+SERVICE_NAME=bfm
+PATH_TO_JAR=/etc/bfm/bfmwatcher/bfm-app.jar
+PATH_TO_APP_PROP=/etc/bfm/bfmwatcher/application.properties
+PATH_TO_LOG_ROTATE=/etc/logrotate.conf
+PATH_TO_LOGD=/etc/logrotate.d/bfmlog
+PID_FILE=/var/run/bfm.pid
+LOG_FILE=/etc/bfm/bfmwatcher/bfm.log
+
+is_running() {
+
+    [ -f "$PID_FILE" ] || return 1
+
+    PID=$(cat "$PID_FILE")
+
+    [ -d "/proc/$PID" ] || {
+        rm -f "$PID_FILE"
+        return 1
+    }
+
+    CMD=$(tr '\0' ' ' < "/proc/$PID/cmdline" 2>/dev/null)
+
+    echo "$CMD" | grep -q "$PATH_TO_JAR"
+
+    if [ $? -eq 0 ]; then
+        return 0
+    fi
+
+    echo "Stale PID file found: $PID"
+    rm -f "$PID_FILE"
+    return 1
+}
+
+start() {
+    echo "Starting $SERVICE_NAME ..."
+
+    if is_running; then
+        echo "$SERVICE_NAME is already running on PID $(cat "$PID_FILE")"
+        return 0
+    fi
+
+    nohup java \
+        -Dspring.config.location="$PATH_TO_APP_PROP" \
+        -jar "$PATH_TO_JAR" \
+        >> "$LOG_FILE" 2>&1 &
+
+    PID=$!
+    echo "$PID" > "$PID_FILE"
+
+    sleep 2
+
+    if kill -0 "$PID" 2>/dev/null; then
+        logrotate -s /etc/bfm/bfmwatcher/logrotate.state $PATH_TO_LOG_ROTATE
+        logrotate -s /etc/bfm/bfmwatcher/logrotate.state -f $PATH_TO_LOGD
+
+        echo "$SERVICE_NAME started on PID $PID"
+        return 0
+    else
+        rm -f "$PID_FILE"
+        echo "$SERVICE_NAME could not start"
+        return 1
+    fi
+}
+
+stop() {
+    if ! is_running; then
+        echo "$SERVICE_NAME is not running"
+        return 0
+    fi
+
+    PID=$(cat "$PID_FILE")
+
+    echo "Stopping $SERVICE_NAME (PID=$PID)..."
+
+    kill "$PID"
+
+    for i in {1..30}
+    do
+        if ! kill -0 "$PID" 2>/dev/null; then
+            rm -f "$PID_FILE"
+            echo "$SERVICE_NAME stopped"
+            return 0
         fi
+        sleep 1
+    done
 
-;;
-stop)
-        export PS_10=$(ps -ef|grep bfmwatcher |awk 'NR==1{print $10}')
-        if [ "$PS_10" = "$PATH_TO_JAR" ]
-        then
-                export PID=$(ps -ef|grep bfmwatcher |awk 'NR==1{print $2}')
-                echo "$SERVICE_NAME is running on $PID pid number"
-                kill $PID;
-                echo "$SERVICE_NAME stopped..."
-        else
-                echo "$SERVICE_NAME is not running ..."
-        fi
-;;
-restart)
-                export PS_10=$(ps -ef|grep bfmwatcher |awk 'NR==1{print $10}')
-                if [ "$PS_10" = "$PATH_TO_JAR" ]
-                then
-                        export PID=$(ps -ef|grep bfmwatcher |awk 'NR==1{print $2}')
-                        echo "$SERVICE_NAME is running on $PID pid number"
-                        kill $PID;
-                        echo "$SERVICE_NAME stopped..."
-                        if [ -f "/etc/bfm/bfmwatcher/bfm.log" ]
-                        then
-                                echo "old logfile archiving..."
-                                mv /etc/bfm/bfmwatcher/bfm.log /etc/bfm/bfmwatcher/bfm_$(date +"%Y-%m-%d_%H-%M-%S").log
-                        fi
+    echo "Force killing PID $PID"
+    kill -9 "$PID" 2>/dev/null
 
-                        nohup java -jar $PATH_TO_JAR -Dspring.config.location=$PATH_TO_APP_PROP >> /etc/bfm/bfmwatcher/bfm.log 2>&1 &
+    rm -f "$PID_FILE"
+    echo "$SERVICE_NAME stopped"
+}
 
-                        export PS_10=$(ps -ef|grep bfmwatcher |awk 'NR==1{print $10}')
-                        if [ "$PS_10" = "$PATH_TO_JAR" ]
-                        then
-                                export PID2=$(ps -ef|grep bfmwatcher |awk 'NR==1{print $2}')
-                                echo "$SERVICE_NAME is restarted on $PID2 pid number"
-                        else
-                                echo "$SERVICE_NAME could not start ..."
-                        fi
-                else
-                        if [ -f "/etc/bfm/bfmwatcher/bfm.log" ]
-                        then
-                                echo "old logfile archiving..."
-                                mv /etc/bfm/bfmwatcher/bfm.log /etc/bfm/bfmwatcher/bfm_$(date +"%Y-%m-%d_%H-%M-%S").log
-                        fi
+restart() {
+    stop
+    sleep 2
+    start
+}
 
-                        nohup java -jar $PATH_TO_JAR -Dspring.config.location=$PATH_TO_APP_PROP > /etc/bfm/bfmwatcher/bfm.log 2>&1 &
+status() {
+    if is_running; then
+        echo "$SERVICE_NAME is running on PID $(cat "$PID_FILE")"
+        return 0
+    else
+        echo "$SERVICE_NAME is not running"
+        return 1
+    fi
+}
 
-                        export PS_10=$(ps -ef|grep bfmwatcher |awk 'NR==1{print $10}')
-                        if [ "$PS_10" = "$PATH_TO_JAR" ]
-                        then
-                                export PID=$(ps -ef|grep bfmwatcher |awk 'NR==1{print $2}')
-                                echo "$SERVICE_NAME is started on $PID pid number"
-                        else
-                                echo "$SERVICE_NAME could not start ..."
-                        fi
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        restart
+        ;;
+    status)
+        status
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac
 
-                fi
-
-;;
- esac
+exit 0
