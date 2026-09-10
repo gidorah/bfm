@@ -1,0 +1,22 @@
+{
+  "_comment": "fast-env healthy fixture: PRIMARY 127.0.10.11:5432. Read by tools/fast-env/pgwire-stub.py (--fixture). Answers pg_is_in_recovery()=f, one pg_stat_replication row for the replica, WAL LSN, timeline 1, usesuper=t, replay-lag projection keyed by replica IP, numeric lsn diff, empty sync names, no wal-receiver rows, zero tablespaces.",
+  "node": "127.0.10.11:5432",
+  "role": "primary",
+  "server_version": "15.4",
+  "wal_lsn": "0/3000060",
+  "timeline_id": 1,
+  "usesuper": "t",
+  "replication": [
+    {
+      "client_addr": "127.0.10.12",
+      "replay_lag": "00:00:00",
+      "application_name": "fastenv_standby",
+      "sync_state": "async"
+    }
+  ],
+  "synchronous_standby_names": "",
+  "master_host": "127.0.10.11",
+  "master_port": "5432",
+  "conninfo": "",
+  "tablespaces": []
+}
