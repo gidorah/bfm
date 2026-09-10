@@ -1,0 +1,15 @@
+{
+  "request": {
+    "method": "POST",
+    "url": "/minipg/rewind",
+    "headers": {
+      "Authorization": {
+        "matches": "Basic .+"
+      }
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": "OK"
+  }
+}

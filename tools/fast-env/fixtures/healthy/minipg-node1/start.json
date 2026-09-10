@@ -1,0 +1,15 @@
+{
+  "request": {
+    "method": "GET",
+    "url": "/minipg/start",
+    "headers": {
+      "Authorization": {
+        "matches": "Basic .+"
+      }
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": "done - server started on node=127.0.10.11"
+  }
+}

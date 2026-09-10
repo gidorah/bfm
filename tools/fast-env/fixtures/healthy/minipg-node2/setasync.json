@@ -1,0 +1,15 @@
+{
+  "request": {
+    "method": "POST",
+    "url": "/minipg/setasync",
+    "headers": {
+      "Authorization": {
+        "matches": "Basic .+"
+      }
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": "OK async-set node=127.0.10.12"
+  }
+}

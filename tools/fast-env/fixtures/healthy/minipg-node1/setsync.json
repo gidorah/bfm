@@ -1,0 +1,15 @@
+{
+  "request": {
+    "method": "POST",
+    "url": "/minipg/setsync",
+    "headers": {
+      "Authorization": {
+        "matches": "Basic .+"
+      }
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": "OK sync-set node=127.0.10.11"
+  }
+}

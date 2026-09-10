@@ -1,0 +1,15 @@
+{
+  "_comment": "fast-env healthy fixture: REPLICA 127.0.10.12:5433. Read by tools/fast-env/pgwire-stub.py (--fixture). Answers pg_is_in_recovery()=t, EMPTY pg_stat_replication, same WAL LSN/timeline as primary (no checkpoint churn), usesuper=t, numeric lsn diff, one pg_stat_wal_receiver row with conninfo host=127.0.10.11 port=5432, zero tablespaces.",
+  "node": "127.0.10.12:5433",
+  "role": "replica",
+  "server_version": "15.4",
+  "wal_lsn": "0/3000060",
+  "timeline_id": 1,
+  "usesuper": "t",
+  "replication": [],
+  "synchronous_standby_names": "",
+  "master_host": "127.0.10.11",
+  "master_port": "5432",
+  "conninfo": "host=127.0.10.11 port=5432 dbname=replication user=bfmuser application_name=fastenv_standby",
+  "tablespaces": []
+}
