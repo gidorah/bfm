@@ -29,6 +29,17 @@
 - Watch strategies accepted by `POST /bfm/watch-strategy/{A|M}` are only `A` (availability) / `M` (manual); other values fail. Destructive ops (`switchover`, `reinit`) only run on the active BFM and pause checks internally.
 - Packaging: systemd unit + `bfm.sh` + `bfmctl` ship from `rpm|deb/src/main/resources/` to `/etc/bfm/bfmwatcher`, service user `postgres`. TLS artifacts at repo root (`bfm.p12`, `bfm.jks`, `cert.pem`, `key.pem`) are sample/dev secrets.
 
+### Local run (dev-only, no prod changes)
+
+- `just local-prepare` generates `CONFIG=_work-tmp/local/application.properties` + `RUN_DIR=_work-tmp/local/run/` from `dev/local/` templates; see `dev/local/README.md`.
+- `just run-local` starts the built jar with `CWD=RUN_DIR` plus `-Dspring.config.location=file:<abs CONFIG>`; `just build` first to refresh the jar.
+- `just local-status` shows ports/pglist from CONFIG + validates `STATE=_work-tmp/local/run/bfm_status.json`; `just local-logs` tails `LOG_FILE=_work-tmp/local/logs/app.log`.
+- `just local-reset` deletes generated `_work-tmp/local/` (safe: regenerable via local-prepare); `just local-verify` checks (a) CONFIG exists, (b) watcher.cluster-port=9995, (c) STATE valid JSON with clusterServers, (d) repo-root bfm_status.json untouched — it does NOT check CWD wiring, live ports, or processes.
+- VS Code F5 config is `BFM — local cluster` (`.vscode/launch.json`): same CWD + `spring.config.location`; run `just local-prepare` (and `just build`) before F5, no preLaunchTask wired.
+- `logging.file.name=../logs/app.log` (resolved from RUN_DIR); `server.pglist=127.0.0.1:5432,127.0.0.1:5433`, `watcher.cluster-pair=no-pair` — no live DB required.
+- Port split (dev-only): BFM `watcher.cluster-port=9995` vs BFM4Patroni `9994` vs `minipg.port=7779`, so a local run never clashes with system services.
+- Generated `_work-tmp/local/**` is git-ignored — never commit it; repo-root `./bfm_status.json` is a sample and local runs must never modify it.
+
 ## Workflow
 
 - Open PRs against `dev` unless explicitly told otherwise. (Both `dev` and `main` exist on origin; past release PRs targeted `main`.)
