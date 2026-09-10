@@ -1,0 +1,56 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+mvn := "./mvnw"
+
+default:
+    @just --list
+
+test:
+    {{ mvn }} -f app/pom.xml test
+
+build:
+    {{ mvn }} -f app/pom.xml clean package
+
+package-all:
+    {{ mvn }} clean package
+
+local_dir := justfile_directory() + "/_work-tmp/local"
+config := local_dir + "/application.properties"
+run_dir := local_dir + "/run"
+state := run_dir + "/bfm_status.json"
+log_file := local_dir + "/logs/app.log"
+
+local-prepare:
+    @mkdir -p "{{ run_dir }}" "{{ local_dir }}/logs"
+    @if [ ! -f "{{ config }}" ]; then cp "{{ justfile_directory() }}/dev/local/application.properties" "{{ config }}"; echo "COPY dev/local/application.properties -> {{ config }}"; else echo "KEEP {{ config }}"; fi
+    @if [ ! -f "{{ state }}" ]; then cp "{{ justfile_directory() }}/dev/local/bfm_status.json.seed" "{{ state }}"; echo "COPY dev/local/bfm_status.json.seed -> {{ state }}"; else echo "KEEP {{ state }}"; fi
+    @echo "watcher.cluster-port=$(grep -E '^[[:space:]]*watcher\.cluster-port[[:space:]]*=' '{{ config }}' | sed 's/.*=[[:space:]]*//')"
+    @echo "server.pglist=$(grep -E '^[[:space:]]*server\.pglist[[:space:]]*=' '{{ config }}' | sed 's/.*=[[:space:]]*//')"
+    @echo "minipg.port=$(grep -E '^[[:space:]]*minipg\.port[[:space:]]*=' '{{ config }}' | sed 's/.*=[[:space:]]*//')"
+    @echo "CONFIG={{ config }}"
+    @echo "RUN_DIR={{ run_dir }}"
+    @echo "STATE={{ state }}"
+    @echo "LOG_FILE={{ log_file }}"
+
+local-reset:
+    @rm -rf "{{ run_dir }}" "{{ local_dir }}/logs" "{{ config }}"
+    @just --justfile "{{ justfile_directory() }}/justfile" local-prepare
+
+local-status:
+    @echo "watcher.cluster-port=$(grep -E '^[[:space:]]*watcher\.cluster-port[[:space:]]*=' '{{ config }}' | sed 's/.*=[[:space:]]*//' || echo 'MISSING (run just local-prepare)')"
+    @echo "server.pglist=$(grep -E '^[[:space:]]*server\.pglist[[:space:]]*=' '{{ config }}' | sed 's/.*=[[:space:]]*//' || echo 'MISSING (run just local-prepare)')"
+    @echo "minipg.port=$(grep -E '^[[:space:]]*minipg\.port[[:space:]]*=' '{{ config }}' | sed 's/.*=[[:space:]]*//' || echo 'MISSING (run just local-prepare)')"
+    ls "{{ run_dir }}"
+    @python3 -c "import json; d=json.load(open('{{ state }}')); print('STATE OK: clusterStatus=%s servers=%d' % (d.get('clusterStatus'), len(d.get('clusterServers', []))))"
+
+local-logs N="100":
+    @if [ -f "{{ log_file }}" ]; then tail -n "{{ N }}" "{{ log_file }}"; else echo "No log file yet at {{ log_file }} (run just run-local first)"; fi
+
+run-local:
+    @cd "{{ run_dir }}" && jar=$(ls ../../../app/target/bfm-app-*.jar 2>/dev/null | head -n 1 || true) && [ -n "$jar" ] || { echo "ERROR: no jar at app/target/bfm-app-*.jar (hint: just build)" >&2; exit 1; } && exec java -Dspring.config.location="file:{{ config }}" -jar "$jar"
+
+local-verify:
+    @test -f "{{ config }}" || (echo "FAIL: CONFIG missing at {{ config }} (run just local-prepare)" >&2; exit 1); echo "OK config exists: {{ config }}"
+    @grep -Eq '^[[:space:]]*watcher\.cluster-port[[:space:]]*=[[:space:]]*9995([[:space:]]*$|[[:space:]])' "{{ config }}" || (echo "FAIL: watcher.cluster-port != 9995 in {{ config }}" >&2; exit 1); echo "OK watcher.cluster-port=9995"
+    @python3 -c "import json,sys; d=json.load(open('{{ state }}')); assert isinstance(d.get('clusterServers'), list) and d['clusterServers'], 'clusterServers missing/empty'; print('OK state valid JSON with clusterServers: {{ state }}')" || (echo "FAIL: STATE not valid JSON with clusterServers: {{ state }}" >&2; exit 1)
+    @git -C "{{ justfile_directory() }}" diff --quiet HEAD -- bfm_status.json || (echo "FAIL: repo-root ./bfm_status.json modified (local runs must not touch it)" >&2; exit 1); echo "OK repo-root bfm_status.json untouched"

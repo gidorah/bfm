@@ -1,0 +1,18 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "java",
+            "name": "BFM — local cluster",
+            "request": "launch",
+            "mainClass": "com.bisoft.bfm.BfmApplication",
+            "projectName": "bfm-app",
+            "cwd": "${workspaceFolder}/_work-tmp/local/run",
+            "vmArgs": [
+                "-Dspring.config.location=file:${workspaceFolder}/_work-tmp/local/application.properties"
+            ],
+            "args": [],
+            "console": "internalConsole"
+        }
+    ]
+}

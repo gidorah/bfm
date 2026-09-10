@@ -1,12 +1,12 @@
 # AGENTS.md
 
-## Build / test (Maven, Java 21, Spring Boot 3.3.4)
+## Build / test (Maven 3.9.12, Java 21, Spring Boot 3.3.4)
 
-- Maven wrapper is broken (`.mvn/wrapper/` was never committed — `sh mvnw` fails). Use system `mvn` (3.9.x) with Java 21.
+- Toolchain: `mise.toml` pins Java `temurin-21.0.11+10.0.LTS`; the Maven wrapper (`./mvnw`, 3.9.12) works — use it, not system `mvn`.
 - Multi-module root (`packaging: pom`): `app` (executable jar), `rpm`, `deb` (packaging only).
-- Build app: `mvn -pl app -am package -DskipTests`
-- Full build incl. packages: `mvn package -DskipTests` (rpm/deb `jdeb`/`rpm-maven-plugin` consume `app/target/bfm-app-*.jar`, so build `app` first; no lint/format/typecheck config exists).
-- Tests: only placeholder `app/src/test/java/com/bisoft/bfm/BfmApplicationTests.java` (plain JUnit, no Spring context). Run: `mvn -pl app test -Dtest=BfmApplicationTests`
+- Daily loop (app only, no rpm/deb tooling needed): `just test` (= `./mvnw -f app/pom.xml test`), `just build` (= `./mvnw -f app/pom.xml clean package`).
+- Full build incl. packages: `just package-all` (= `./mvnw clean package`; add `-DskipTests` to skip tests). rpm/deb `jdeb`/`rpm-maven-plugin` consume `app/target/bfm-app-*.jar`. No lint/format/typecheck config exists.
+- Tests: only placeholder `app/src/test/java/com/bisoft/bfm/BfmApplicationTests.java` (plain JUnit, no Spring context).
 - Only CI is CodeQL autobuild on `main` (`.github/workflows/codeql-analysis.yml`); no build/test gate to mirror.
 
 ## Structure / entrypoints
@@ -28,6 +28,17 @@
 - Encrypted secrets: when `bfm.user-crypted=true`, passwords/TLS secret are AES-GCM via `SymmetricEncryptionUtil` (key `bfm.approval-key`, default `B1s0ft25`). Generate values via live endpoint `POST /bfm/encrypt/{clear}` (i.e. `bfmctl -encrypt <clear>`), never hand-roll.
 - Watch strategies accepted by `POST /bfm/watch-strategy/{A|M}` are only `A` (availability) / `M` (manual); other values fail. Destructive ops (`switchover`, `reinit`) only run on the active BFM and pause checks internally.
 - Packaging: systemd unit + `bfm.sh` + `bfmctl` ship from `rpm|deb/src/main/resources/` to `/etc/bfm/bfmwatcher`, service user `postgres`. TLS artifacts at repo root (`bfm.p12`, `bfm.jks`, `cert.pem`, `key.pem`) are sample/dev secrets.
+
+### Local run (dev-only, no prod changes)
+
+- `just local-prepare` generates `CONFIG=_work-tmp/local/application.properties` + `RUN_DIR=_work-tmp/local/run/` from `dev/local/` templates; see `dev/local/README.md`.
+- `just run-local` starts the built jar with `CWD=RUN_DIR` plus `-Dspring.config.location=file:<abs CONFIG>`; `just build` first to refresh the jar.
+- `just local-status` shows ports/pglist from CONFIG + validates `STATE=_work-tmp/local/run/bfm_status.json`; `just local-logs` tails `LOG_FILE=_work-tmp/local/logs/app.log`.
+- `just local-reset` deletes generated `_work-tmp/local/` (safe: regenerable via local-prepare); `just local-verify` checks (a) CONFIG exists, (b) watcher.cluster-port=9995, (c) STATE valid JSON with clusterServers, (d) repo-root bfm_status.json untouched — it does NOT check CWD wiring, live ports, or processes.
+- VS Code F5 config is `BFM — local cluster` (`.vscode/launch.json`): same CWD + `spring.config.location`; run `just local-prepare` (and `just build`) before F5, no preLaunchTask wired.
+- `logging.file.name=../logs/app.log` (resolved from RUN_DIR); `server.pglist=127.0.0.1:5432,127.0.0.1:5433`, `watcher.cluster-pair=no-pair` — no live DB required.
+- Port split (dev-only): BFM `watcher.cluster-port=9995` vs BFM4Patroni `9994` vs `minipg.port=7779`, so a local run never clashes with system services.
+- Generated `_work-tmp/local/**` is git-ignored — never commit it; repo-root `./bfm_status.json` is a sample and local runs must never modify it.
 
 ## Workflow
 
