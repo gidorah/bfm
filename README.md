@@ -25,3 +25,15 @@ sudo dnf install -y bfm-rpm-package
 
 sudo yum install -y https://nexus.bisoft.com.tr/repository/bfm-yum/repo/bisoft-repo-1.0-1.noarch.rpm
 sudo yum install -y bfm-rpm-package
+
+## Local development
+
+For a reproducible local run (isolated config, state and logs under `_work-tmp/local/`, BFM on port 9995 so it never clashes with BFM4Patroni on 9994):
+
+```bash
+just local-prepare   # generate local config + state from dev/local/ templates
+just build           # build the app jar
+just run-local       # ...or F5 "BFM — local cluster" in VS Code
+```
+
+See [dev/local/README.md](dev/local/README.md) for the full flow (`local-status` / `local-logs` / `local-reset` / `local-verify`).
