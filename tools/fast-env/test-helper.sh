@@ -151,6 +151,18 @@ fi
 # Each just recipe runs in its own shell/pgid; ownership must describe the
 # launching shell (refreshed by start-dependencies), not the caller.
 bash "$HELPER" start-dependencies > /dev/null 2>&1
+OWNER_BEFORE="$(grep -E '^pgid=' "$FAST_DIR/.owner" 2>/dev/null | cut -d= -f2-)"
+# Pure-adopt re-run (nothing to launch) must preserve the existing owner.
+if setsid bash "$HELPER" start-dependencies > /dev/null 2>&1; then
+  OWNER_AFTER="$(grep -E '^pgid=' "$FAST_DIR/.owner" 2>/dev/null | cut -d= -f2-)"
+  if [ -n "$OWNER_BEFORE" ] && [ "$OWNER_BEFORE" = "$OWNER_AFTER" ]; then
+    ok "adopt-only start preserves ownership"
+  else
+    bad "adopt-only start preserves ownership (before=$OWNER_BEFORE after=$OWNER_AFTER)"
+  fi
+else
+  bad "adopt-only start preserves ownership (adopt re-run failed)"
+fi
 if setsid bash "$HELPER" stop > /dev/null 2>&1; then
   DEADLINE=$((SECONDS + 25))
   while (( SECONDS < DEADLINE )) && { tuple_up 127.0.10.11 5432 || tuple_up 127.0.10.12 5433 || tuple_up 127.0.10.11 7779 || tuple_up 127.0.10.12 7779; }; do sleep 0.5; done
@@ -369,6 +381,24 @@ if bash "$HELPER" logs 50 >"$LOGS_OUT" 2>&1; then
 else
   bad "logs output redacted (logs command failed)"
 fi
+
+# --- 13b. leak-scan: blobs fail, innocent literals pass ------------------------
+# With fixed bfm/bfm creds the literal is public; only the Basic blob form
+# must never be stored (validate's tripwire uses the same scanner).
+LEAK_FIX="$(mktemp -d)"
+printf 'this is the active bfm pair\nCluster Status is HEALTHY\n' >"$LEAK_FIX/clean.log"
+printf 'Authorization: Basic YmZtOmJmbQ==\n' >"$LEAK_FIX/dirty.log"
+if bash "$REPO_ROOT/tools/fast-env/leak-scan.sh" "YmZtOmJmbQ==" "$LEAK_FIX/clean.log" 2>/dev/null; then
+  ok "leak-scan passes innocent log text"
+else
+  bad "leak-scan passes innocent log text"
+fi
+if bash "$REPO_ROOT/tools/fast-env/leak-scan.sh" "YmZtOmJmbQ==" "$LEAK_FIX/dirty.log" 2>/dev/null; then
+  bad "leak-scan catches credential blob"
+else
+  ok "leak-scan catches credential blob"
+fi
+rm -rf "$LEAK_FIX"
 
 # --- 14. just fast-* delegates; just local-* untouched -------------------------
 if grep -Eq '^fast-prepare' "$REPO_ROOT/justfile" \

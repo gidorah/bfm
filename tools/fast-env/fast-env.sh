@@ -620,6 +620,8 @@ cmd_start_dependencies() {
   redact_refresh
   mkdir -p "$LOGS"
   : >>"$PIDS_FILE"
+  local pids_before
+  pids_before="$(grep -c . "$PIDS_FILE" 2>/dev/null || true)"
 
   local rc=0
   ensure_pgwire "$PG1_IP" "$PG1_PORT" "$PGWIRE_FIX1" || rc=1
@@ -630,7 +632,14 @@ cmd_start_dependencies() {
     err "start-dependencies: INCOMPLETE - provide the missing pieces above, then re-run (listening tuples are adopted; 'stop' tears down helper-owned stubs)"
     return 1
   fi
-  write_owner
+  # Restamp ownership only when this invocation actually launched processes.
+  # Pure-adopt runs must preserve the existing owner, or stop/reset would
+  # refuse from every shell afterwards (the launcher’s pgid is what counts).
+  local pids_after
+  pids_after="$(grep -c . "$PIDS_FILE" 2>/dev/null || true)"
+  if [ "${pids_after:-0}" -gt "${pids_before:-0}" ]; then
+    write_owner
+  fi
   log "start-dependencies: all stub tuples listening"
   note "start-dependencies: all stub tuples listening"
   return 0
@@ -798,19 +807,22 @@ EOF
   note "log: fixappname (6s) silent-by-design when app names healthy (no repair line expected; 30s pgpass proves the loop had opportunity)"
   note "log: checkUnavailable (7s) silent-by-design when no INACCESSIBLE (no rewind line expected; VIP/pgpass prove the loop had opportunity)"
 
-  # -- Redaction tripwire (fail-closed): generated secrets must never hit stored logs.
-  # Helper/stub logs go through pre-storage redaction; the IDE-owned BFM writes
-  # $bfm_log directly, so any secret there means the path cannot be redacted.
-  local f
-  if grep -qF -- "$pgpass" "$bfm_log" 2>/dev/null || grep -qF -- "$mpass" "$bfm_log" 2>/dev/null; then
-    err "stored BFM log $bfm_log contains generated credentials (pre-storage redaction failed; refusing)"
-    return 1
-  fi
-  for f in "$HELPER_LOG" "$LOGS"/stub-*.log "$LOGS"/bfm-helper.log; do
+  # -- Redaction tripwire (fail-closed): credential-bearing forms must never
+  # hit stored logs. The literal password is NOT scanned: with fixed test-only
+  # creds (bfm/bfm) it is public and ubiquitous (even validate's own required
+  # evidence line contains it). What must never leak is the secret-bearing
+  # form clients actually send: the HTTP-Basic base64 blob, computed here
+  # from the live CONFIG values so any future creds stay covered.
+  local f pg_blob mini_blob
+  pg_blob="$(printf '%s:%s' "$pguser" "$pgpass" | base64 2>/dev/null | tr -d '\n')"
+  mini_blob="$(printf '%s:%s' "$muser" "$mpass" | base64 2>/dev/null | tr -d '\n')"
+  [ -n "$pg_blob" ] && [ -n "$mini_blob" ] \
+    || { err "cannot derive credential blobs for leak scan (refusing)"; return 1; }
+  for f in "$bfm_log" "$HELPER_LOG" "$LOGS"/stub-*.log "$LOGS"/bfm-helper.log; do
     [ -f "$f" ] || continue
-    if grep -qF -- "$pgpass" "$f" 2>/dev/null || grep -qF -- "$mpass" "$f" 2>/dev/null; then
-      err "stored log $f contains generated credentials (pre-storage redaction failed; refusing)"
-      return 1
+    "$TOOLS_DIR/leak-scan.sh" "$pg_blob" "$f" || return 1
+    if [ "$mini_blob" != "$pg_blob" ]; then
+      "$TOOLS_DIR/leak-scan.sh" "$mini_blob" "$f" || return 1
     fi
   done
 
