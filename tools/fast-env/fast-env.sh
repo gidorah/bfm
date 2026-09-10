@@ -263,10 +263,18 @@ download_wiremock() {
 }
 
 # --- PID/group ownership ----------------------------------------------------------
-# OWNER_FILE is written by `prepare` (dir + pid + pgid + date). stop/reset must
-# CHECK the recorded pgid against live truth, never just trust the dir line.
+# OWNER_FILE is written by `prepare` and refreshed by `start-dependencies` /
+# `start` (whichever shell actually launches processes). Each just recipe runs
+# in its own shell/process-group, so the prepare-time pgid is stale by stop
+# time; ownership must describe the launching shell. stop/reset CHECK the
+# recorded pgid against live truth, never just trust the dir line.
 # Fail-closed: refuse to kill/delete when the group cannot be proven, so a
 # foreign or tampered PIDS file can never cause us to kill foreign PIDs.
+write_owner() { # (re)stamp ownership of FAST_DIR to this shell
+  printf 'dir=%s\npid=%s\npgid=%s\ndate=%s\n' \
+    "$(canonical "$FAST_DIR")" "$$" "$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')" "$(date -u '+%FT%TZ')" >"$OWNER_FILE"
+  chmod 600 "$OWNER_FILE" 2>/dev/null || true
+}
 check_owner() { # check_owner <op>
   local op="${1:-stop}"
   [ -f "$OWNER_FILE" ] || return 0
@@ -280,7 +288,7 @@ check_owner() { # check_owner <op>
     || { err "ownership mismatch ($OWNER_FILE points at '$owner_dir'); refusing to $op"; return 1; }
   case "$owner_pid" in ''|*[!0-9]*) err "ownership file $OWNER_FILE has invalid pid '$owner_pid' (refusing $op)"; return 1;; esac
   case "$owner_pgid" in ''|*[!0-9]*) err "ownership file $OWNER_FILE has invalid pgid '$owner_pgid' (refusing $op)"; return 1;; esac
-  # When the preparing pid is still alive, its live pgid must match the record.
+  # When the launching pid is still alive, its live pgid must match the record.
   if kill -0 "$owner_pid" 2>/dev/null; then
     local live_pgid
     live_pgid="$(ps -o pgid= -p "$owner_pid" 2>/dev/null | tr -d ' ')"
@@ -309,28 +317,34 @@ check_owner() { # check_owner <op>
 # --- tuple-aware occupancy ------------------------------------------------------
 # tuple_listening <ip> <port>: true when anything (incl. 0.0.0.0 / :: wildcard)
 # holds the exact addr:port tuple. Prefers ss, falls back to /proc/net/tcp*.
+# Java binds dual-stack, so ss shows IPv4-mapped IPv6 ([::ffff:127.0.0.1]:9995):
+# normalize that form to plain IPv4 before comparing. SS_BIN is overridable
+# for tests (fixture printer emitting ss -tlnH-shaped lines).
 tuple_listening() {
   local ip="$1" port="$2" line
-  if command -v ss >/dev/null 2>&1; then
+  if command -v "${SS_BIN:-ss}" >/dev/null 2>&1; then
     while IFS= read -r line; do
       [ -z "$line" ] && continue
       if printf '%s' "$line" | awk -v IP="$ip" -v P="$port" '
         { f=$4; sub(/%[^: ]*:/, ":", f); n=split(f,a,":"); p=a[n];
           addr=f; sub(/:[^:]*$/, "", addr); gsub(/^\[|\]$/, "", addr);
+          sub(/^::[fF]{4}:/, "", addr);
           if (p==P && (addr==IP || addr=="0.0.0.0" || addr=="*" || addr=="::")) exit 0; exit 1 }'; then
         return 0
       fi
-    done < <(ss -tlnH 2>/dev/null || true)
+    done < <("${SS_BIN:-ss}" -tlnH 2>/dev/null || true)
     return 1
   fi
   # Fallback: /proc/net/tcp + tcp6, little-endian hex, LISTEN == 0A.
+  # tcp6 shows mapped binds as 0000000000000000FFFF0000+H; strip that prefix.
   local f hex_ip hex_port
   hex_port=$(printf '%04X' "$port")
   hex_ip=$(printf '%s' "$ip" | awk -F. '{printf "%02X%02X%02X%02X",$4,$3,$2,$1}')
   for f in /proc/net/tcp /proc/net/tcp6; do
     [ -r "$f" ] || continue
     if awk -v H="$hex_ip" -v P="$hex_port" 'NR>1 && $4=="0A" {
-        split($2,a,":"); ip=a[1]; port=a[2];
+        split($2,a,":"); ip=toupper(a[1]); port=a[2];
+        sub(/^0000000000000000FFFF0000/, "", ip);
         if (port==P && (ip==H || ip=="00000000" || ip=="00000000000000000000000000000000")) exit 0
       } END{exit 1}' "$f"; then
       return 0
@@ -346,6 +360,7 @@ listener_pid() {
   ss -tlnpH 2>/dev/null | awk -v IP="$ip" -v P="$port" '
     { f=$4; sub(/%[^: ]*:/, ":", f); n=split(f,a,":"); p=a[n];
       addr=f; sub(/:[^:]*$/, "", addr); gsub(/^\[|\]$/, "", addr);
+      sub(/^::[fF]{4}:/, "", addr);
       if (p==P && (addr==IP || addr=="0.0.0.0" || addr=="*" || addr=="::")) {
         if (match($0, /pid=[0-9]+/)) { print substr($0, RSTART+4, RLENGTH-4); exit }
       } }' || true
@@ -488,9 +503,8 @@ cmd_prepare() {
   redact_refresh
   printf '%s\n' "$launch_id" >"$LAUNCH_FILE"
   printf '%s\n' "$scenario" >"$SCENARIO_FILE"
-  printf 'dir=%s\npid=%s\npgid=%s\ndate=%s\n' \
-    "$(canonical "$FAST_DIR")" "$$" "$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')" "$(date -u '+%FT%TZ')" >"$OWNER_FILE"
-  chmod 600 "$OWNER_FILE" "$LAUNCH_FILE" "$SCENARIO_FILE" 2>/dev/null || true
+  write_owner
+  chmod 600 "$LAUNCH_FILE" "$SCENARIO_FILE" 2>/dev/null || true
 
   # Pinned MiniPG artifact: download + SHA-256-verify into the tool cache
   # (outside the run dir so `reset` keeps it). Fail-closed on download/verify.
@@ -616,6 +630,7 @@ cmd_start_dependencies() {
     err "start-dependencies: INCOMPLETE - provide the missing pieces above, then re-run (listening tuples are adopted; 'stop' tears down helper-owned stubs)"
     return 1
   fi
+  write_owner
   log "start-dependencies: all stub tuples listening"
   note "start-dependencies: all stub tuples listening"
   return 0
@@ -943,6 +958,7 @@ cmd_start() {
   local p
   p="$(cd "$RUN_DIR" && launch_bg_redacted "$LOGS/bfm-helper.log" no_proxy_env nohup java -Dspring.config.location="file:$CONFIG" -jar "$jar")"
   printf '%s\n' "$p" >"$HELPER_BFM_PID"
+  write_owner
   log "start helper-owned BFM pid=$p jar=$jar"
   note "helper-owned BFM starting pid=$p (logs: $LOGS/bfm-helper.log, $LOGS/app.log)"
   return 0

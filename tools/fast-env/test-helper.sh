@@ -147,6 +147,38 @@ else
   ok "stop tears down helper-owned stubs (pgwire + WireMock)"
 fi
 
+# --- 4b. stop works from a different process group -----------------------------
+# Each just recipe runs in its own shell/pgid; ownership must describe the
+# launching shell (refreshed by start-dependencies), not the caller.
+bash "$HELPER" start-dependencies > /dev/null 2>&1
+if setsid bash "$HELPER" stop > /dev/null 2>&1; then
+  DEADLINE=$((SECONDS + 25))
+  while (( SECONDS < DEADLINE )) && { tuple_up 127.0.10.11 5432 || tuple_up 127.0.10.12 5433 || tuple_up 127.0.10.11 7779 || tuple_up 127.0.10.12 7779; }; do sleep 0.5; done
+  if tuple_up 127.0.10.11 5432 || tuple_up 127.0.10.12 5433 || tuple_up 127.0.10.11 7779 || tuple_up 127.0.10.12 7779; then
+    bad "stop works across process groups (stubs still up)"
+  else
+    ok "stop works across process groups"
+  fi
+else
+  bad "stop works across process groups (setsid stop refused)"
+fi
+
+# --- 4c. IPv4-mapped IPv6 detection (Java dual-stack regression) ---------------
+# Java binds dual-stack: ss shows [::ffff:127.0.0.1]:9995, which tuple
+# detection must normalize to 127.0.0.1 (validate went red on this).
+SS_FIX_DIR="$(mktemp -d)"
+cat >"$SS_FIX_DIR/ss" <<'EOF'
+#!/bin/bash
+printf 'LISTEN 0 128 [::ffff:127.0.0.1]:9995 *:* users:(("java",pid=99999,fd=1))\n'
+EOF
+chmod +x "$SS_FIX_DIR/ss"
+if SS_BIN="$SS_FIX_DIR/ss" bash "$HELPER" status 2>/dev/null | grep -q "tuple 127.0.0.1:9995: LISTENING"; then
+  ok "tuple detection sees Java-mapped [::ffff:127.0.0.1]:9995"
+else
+  bad "tuple detection sees Java-mapped [::ffff:127.0.0.1]:9995"
+fi
+rm -rf "$SS_FIX_DIR"
+
 # --- 5. status / logs / stop work without side effects ------------------------
 bash "$HELPER" status > /dev/null 2>&1 && ok "status exits 0" || bad "status exits 0"
 bash "$HELPER" logs 5 > /dev/null 2>&1 && ok "logs exits 0" || bad "logs exits 0"
