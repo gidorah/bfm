@@ -1,12 +1,12 @@
 # AGENTS.md
 
-## Build / test (Maven, Java 21, Spring Boot 3.3.4)
+## Build / test (Maven 3.9.12, Java 21, Spring Boot 3.3.4)
 
-- Maven wrapper is broken (`.mvn/wrapper/` was never committed — `sh mvnw` fails). Use system `mvn` (3.9.x) with Java 21.
+- Toolchain: `mise.toml` pins Java `temurin-21.0.11+10.0.LTS`; the Maven wrapper (`./mvnw`, 3.9.12) works — use it, not system `mvn`.
 - Multi-module root (`packaging: pom`): `app` (executable jar), `rpm`, `deb` (packaging only).
-- Build app: `mvn -pl app -am package -DskipTests`
-- Full build incl. packages: `mvn package -DskipTests` (rpm/deb `jdeb`/`rpm-maven-plugin` consume `app/target/bfm-app-*.jar`, so build `app` first; no lint/format/typecheck config exists).
-- Tests: only placeholder `app/src/test/java/com/bisoft/bfm/BfmApplicationTests.java` (plain JUnit, no Spring context). Run: `mvn -pl app test -Dtest=BfmApplicationTests`
+- Daily loop (app only, no rpm/deb tooling needed): `just test` (= `./mvnw -f app/pom.xml test`), `just build` (= `./mvnw -f app/pom.xml clean package`).
+- Full build incl. packages: `just package-all` (= `./mvnw clean package`; add `-DskipTests` to skip tests). rpm/deb `jdeb`/`rpm-maven-plugin` consume `app/target/bfm-app-*.jar`. No lint/format/typecheck config exists.
+- Tests: only placeholder `app/src/test/java/com/bisoft/bfm/BfmApplicationTests.java` (plain JUnit, no Spring context).
 - Only CI is CodeQL autobuild on `main` (`.github/workflows/codeql-analysis.yml`); no build/test gate to mirror.
 
 ## Structure / entrypoints
