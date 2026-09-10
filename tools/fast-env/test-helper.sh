@@ -59,28 +59,15 @@ if bash "$HELPER" prepare healthy >"$PREP_OUT" 2>&1; then
     && ok "config watcher.cluster-pair=no-pair" || bad "config watcher.cluster-pair=no-pair"
   grep -Eq '^[[:space:]]*minipg\.port[[:space:]]*=[[:space:]]*7779' "$FAST_DIR/application.properties" \
     && ok "config minipg.port=7779" || bad "config minipg.port=7779"
-  PW="$(grep -E '^[[:space:]]*server\.pgpassword[[:space:]]*=' "$FAST_DIR/application.properties" | sed 's/.*=[[:space:]]*//')"
-  if [ -n "${PW:-}" ] && ! grep -qF "$PW" "$PREP_OUT"; then
-    ok "prepare output redacts generated password"
-  else
-    bad "prepare output redacts generated password"
-  fi
-  if grep -qF "@@FAST_PGUSER@@" "$FAST_DIR/application.properties" \
-    || grep -qF "@@FAST_PGPASSWORD@@" "$FAST_DIR/application.properties" \
-    || grep -qF "@@FAST_MINIPG_USER@@" "$FAST_DIR/application.properties" \
-    || grep -qF "@@FAST_MINIPG_PASSWORD@@" "$FAST_DIR/application.properties"; then
-    bad "prepare substitutes all @@FAST_*@@ tokens"
-  else
-    ok "prepare substitutes all @@FAST_*@@ tokens"
-  fi
-  # Per-run freshness: re-prepare must mint new credentials.
-  bash "$HELPER" prepare healthy > /dev/null 2>&1
-  PW2="$(grep -E '^[[:space:]]*server\.pgpassword[[:space:]]*=' "$FAST_DIR/application.properties" | sed 's/.*=[[:space:]]*//')"
-  if [ -n "${PW2:-}" ] && [ "$PW" != "$PW2" ]; then
-    ok "prepare mints fresh per-run credentials"
-  else
-    bad "prepare mints fresh per-run credentials"
-  fi
+  # Fixed test-only credentials bfm/bfm (no per-run secrets).
+  for key in 'server\.pguser' 'server\.pgpassword' 'minipg\.username' 'minipg\.password'; do
+    VAL="$(grep -E "^[[:space:]]*$key[[:space:]]*=" "$FAST_DIR/application.properties" | sed 's/.*=[[:space:]]*//' | tail -n 1)"
+    if [ "$VAL" = "bfm" ]; then
+      ok "config $key=bfm (fixed test-only creds)"
+    else
+      bad "config $key=bfm (fixed test-only creds, got '$VAL')"
+    fi
+  done
 else
   bad "prepare healthy exits 0 (see $PREP_OUT)"
 fi
@@ -330,27 +317,25 @@ else
   rm -f "$FAST_DIR/.pids"
 fi
 
-# --- 13. redaction: stored logs redacted before storage (fail-closed) ----------
-CUR_PW="$(grep -E '^[[:space:]]*server\.pgpassword[[:space:]]*=' "$FAST_DIR/application.properties" | sed 's/.*=[[:space:]]*//')"
-CUR_MP="$(grep -E '^[[:space:]]*minipg\.password[[:space:]]*=' "$FAST_DIR/application.properties" | sed 's/.*=[[:space:]]*//')"
-if [ -n "${CUR_PW:-}" ] && [ -n "${CUR_MP:-}" ]; then
-  if grep -rqF -- "$CUR_PW" "$FAST_DIR/logs" 2>/dev/null || grep -rqF -- "$CUR_MP" "$FAST_DIR/logs" 2>/dev/null; then
-    bad "stored logs redacted before storage"
+# --- 13. redaction: credential-bearing forms redacted (fail-closed) ------------
+# Fixed test-only creds are bfm/bfm, so the literal value is public and
+# ubiquitous in logs; what must never leak is its secret-bearing form, the
+# Basic blob YmZtOmJmbQ== (bfm:bfm).
+BASIC_BLOB="YmZtOmJmbQ=="
+if grep -rqF -- "$BASIC_BLOB" "$FAST_DIR/logs" 2>/dev/null; then
+  bad "stored logs redacted before storage"
+else
+  ok "stored logs redacted before storage"
+fi
+LOGS_OUT="$(mktemp)"
+if bash "$HELPER" logs 50 >"$LOGS_OUT" 2>&1; then
+  if grep -qF -- "$BASIC_BLOB" "$LOGS_OUT" 2>/dev/null; then
+    bad "logs output redacted"
   else
-    ok "stored logs redacted before storage"
-  fi
-  LOGS_OUT="$(mktemp)"
-  if bash "$HELPER" logs 50 >"$LOGS_OUT" 2>&1; then
-    if grep -qF -- "$CUR_PW" "$LOGS_OUT" 2>/dev/null || grep -qF -- "$CUR_MP" "$LOGS_OUT" 2>/dev/null; then
-      bad "logs output redacted"
-    else
-      ok "logs output redacted"
-    fi
-  else
-    bad "logs output redacted (logs command failed)"
+    ok "logs output redacted"
   fi
 else
-  bad "stored logs redacted before storage (missing secrets in CONFIG)"
+  bad "logs output redacted (logs command failed)"
 fi
 
 # --- 14. just fast-* delegates; just local-* untouched -------------------------

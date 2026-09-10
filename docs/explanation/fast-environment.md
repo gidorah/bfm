@@ -26,8 +26,8 @@ WireMock artifact) are specified in the helper, not assumed.
 | Peer BFM | `no-pair` (stub deferred; `BfmAccessUtil` short-circuits) |
 
 `server.pglist=127.0.10.11:5432,127.0.10.12:5433`, `minipg.port=7779`,
-`minipg.use-tls=false`, `bfm.use-tls=false`, generated per-run Basic-auth
-creds. BFM has global MiniPG creds, so routing is proven with distinct
+`minipg.use-tls=false`, `bfm.use-tls=false`, fixed test-only credentials bfm/bfm
+(loopback-only, same convention as bfm4patroni's fast env). BFM has global MiniPG creds, so routing is proven with distinct
 node-specific responses/events, not cross-credential isolation. Port checks
 test addr/port tuples (and wildcard conflicts), never bare ports.
 

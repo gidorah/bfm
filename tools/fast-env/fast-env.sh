@@ -26,13 +26,10 @@
 #                                               this helper only respects it, never creates it)
 #   _work-tmp/fast-env-tool-cache/              pinned WireMock jar (survives `reset`)
 #
-# Fixture credential tokens: `prepare` copies dev/fast-env/application.properties
-# (read-only template) and substitutes the @@FAST_*@@ per-run credential tokens
-# fresh on every run (fail-closed on leftovers). An inline fallback is used only
-# when the template is absent and carries the same loopback topology + tokens.
-#
-# Fixture credential tokens (substituted in config + copied fixtures):
-#   @@FAST_PGUSER@@ @@FAST_PGPASSWORD@@ @@FAST_MINIPG_USER@@ @@FAST_MINIPG_PASSWORD@@
+# Fast-env credentials are fixed test-only bfm/bfm (loopback-only, same as
+# bfm4patroni's fast env). `prepare` copies dev/fast-env/application.properties
+# (read-only template) verbatim. An inline fallback is used only when the
+# template is absent and carries the same loopback topology + fixed creds.
 #
 # Stub entry points:
 #   tools/fast-env/pgwire-stub.py --host/--port/--fixture (one process per node)
@@ -119,13 +116,19 @@ note() { printf '%s\n' "$*"; }
 
 # Pre-storage redaction: strip passwords / Basic creds before anything hits disk.
 # Static patterns live in REDACT_STATIC; redact_refresh appends the literal
-# per-run secrets from CONFIG. redact_refresh runs in normal flow only.
+# configured secrets from CONFIG — except the fixed public test-only value
+# "bfm" (loopback-only fast env, same convention as bfm4patroni): redacting
+# that literal would mangle every innocent mention, and BFM's own file log
+# bypasses this pipeline anyway. Its only secret-bearing form, the Basic
+# blob YmZtOmJmbQ== (bfm:bfm), is covered by a static rule below.
+# redact_refresh runs in normal flow only.
 # PROCsub SAFETY: redact()'s body MUST stay a single simple command. A compound
 # body (if/list/||) in a >( ) target combined with a $( ) capture hangs bash:
 # the extra fork level inherits the capture pipe's write end, so $( ) never
 # completes. Verified by bisection; do not "improve" this function.
 REDACT_STATIC=(
   -e 's/[Aa]uthorization:[[:space:]]*[Bb]asic [A-Za-z0-9+/=:_-]*/Authorization: Basic [REDACTED]/g'
+  -e 's/YmZtOmJmbQ==/[REDACTED]/g'
   -e 's/\("[Pp]assword"[[:space:]]*:[[:space:]]*"\)[^"]*"/\1[REDACTED]"/g'
   -e 's/\([Pp]assword[=:][[:space:]]*\)[^&"'\'']*/\1[REDACTED]/g'
   -e 's/\([Tt]ls-secret[=:][[:space:]]*\)[^&"'\'']*/\1[REDACTED]/g'
@@ -139,7 +142,13 @@ redact_refresh() {
     local s
     for key in 'server\.pgpassword' 'minipg\.password' 'server\.pguser' 'minipg\.username'; do
       s="$(config_val "$key" || true)"
-      [ -n "$s" ] && REDACT_EXPRS+=(-e "s/$s/[REDACTED]/g")
+      # Skip the fixed public test-only "bfm": redacting that literal would
+      # mangle innocent log text; its secret-bearing Basic blob is covered
+      # by the static rule. Any other configured secret is still redacted.
+      # (if-form: a failing middle test in an && chain trips set -e.)
+      if [ -n "$s" ] && [ "$s" != "bfm" ]; then
+        REDACT_EXPRS+=(-e "s/$s/[REDACTED]/g")
+      fi
     done
   fi
 }
@@ -372,15 +381,10 @@ config_val() { # config_val <key>: raw value from generated CONFIG
   grep -E "^[[:space:]]*$1[[:space:]]*=" "$CONFIG" 2>/dev/null | sed 's/.*=[[:space:]]*//' | tail -n 1
 }
 
-rand_hex() {
-  if command -v openssl >/dev/null 2>&1; then openssl rand -hex 12 2>/dev/null && return 0; fi
-  od -An -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' | head -c 24
-}
-
-# Render CONFIG from the dev/fast-env template (or the inline fallback) and
-# substitute the @@FAST_*@@ per-run credential tokens (fail-closed on leftovers).
-render_config() { # render_config <pguser> <pgpass> <muser> <mpass> <launch> <scenario>
-  local pguser="$1" pgpass="$2" muser="$3" mpass="$4" launch_id="$5" scenario="$6"
+# Render CONFIG from the dev/fast-env template (or the inline fallback).
+# Credentials are fixed test-only bfm/bfm (loopback-only); no substitution.
+render_config() { # render_config <launch> <scenario>
+  local launch_id="$1" scenario="$2"
   local template="$REPO_ROOT/dev/fast-env/application.properties"
   if [ -f "$template" ]; then
     cp "$template" "$CONFIG"
@@ -392,8 +396,8 @@ render_config() { # render_config <pguser> <pgpass> <muser> <mpass> <launch> <sc
 app.bfm-hc-clustername          = BFMCluster
 app.custom-logo-path            =
 server.address                  = 127.0.0.1
-server.pguser                   = @@FAST_PGUSER@@
-server.pgpassword               = @@FAST_PGPASSWORD@@
+server.pguser                   = bfm
+server.pgpassword               = bfm
 watcher.cluster-port            = 9995
 watcher.cluster-pair            = no-pair
 app.timeout-ignorance-count     = 3
@@ -404,8 +408,8 @@ bfm.use-tls                     = false
 minipg.use-tls                  = false
 bfm.tls-secret                  =
 bfm.tls-key-store               = bfm.p12
-minipg.username                 = @@FAST_MINIPG_USER@@
-minipg.password                 = @@FAST_MINIPG_PASSWORD@@
+minipg.username                 = bfm
+minipg.password                 = bfm
 minipg.port                     = 7779
 heartbeat.interval              = 10
 heartbeat.query                 = select 1
@@ -423,8 +427,7 @@ spring.mail.properties.mail.smtp.starttls.enable=false
 logging.file.name=../logs/app.log
 EOF
   fi
-  sed -i -e "s/@@FAST_PGUSER@@/${pguser}/g" -e "s/@@FAST_PGPASSWORD@@/${pgpass}/g" \
-         -e "s/@@FAST_MINIPG_USER@@/${muser}/g" -e "s/@@FAST_MINIPG_PASSWORD@@/${mpass}/g" "$CONFIG"
+  # Fail-closed: no unsubstituted placeholders may remain.
   local tok
   for tok in '@@FAST_PGUSER@@' '@@FAST_PGPASSWORD@@' '@@FAST_MINIPG_USER@@' '@@FAST_MINIPG_PASSWORD@@'; do
     if grep -qF "$tok" "$CONFIG"; then
@@ -442,15 +445,6 @@ EOF
   cat "$tmp" >"$CONFIG"
   rm -f "$tmp"
   chmod 600 "$CONFIG"
-}
-
-# Substitute @@FAST_*@@ tokens inside copied fixtures (verbatim when absent).
-substitute_fixture_tokens() { # <dst> <pguser> <pgpass> <muser> <mpass>
-  local dst="$1"
-  grep -rlZ -e '@@FAST_PGUSER@@' -e '@@FAST_PGPASSWORD@@' -e '@@FAST_MINIPG_USER@@' -e '@@FAST_MINIPG_PASSWORD@@' \
-    "$dst" 2>/dev/null \
-    | xargs -0 -r sed -i -e "s/@@FAST_PGUSER@@/$2/g" -e "s/@@FAST_PGPASSWORD@@/$3/g" \
-      -e "s/@@FAST_MINIPG_USER@@/$4/g" -e "s/@@FAST_MINIPG_PASSWORD@@/$5/g" || true
 }
 
 # launch_bg_redacted <logfile> <cmd...>: background cmd with stdout/stderr
@@ -475,7 +469,7 @@ cmd_prepare() {
   [ "$scenario" = "healthy" ] \
     || { err "unknown scenario '$scenario' (v1 supports only 'healthy')"; return 1; }
   if [ -f "$IDE_MARKER" ]; then
-    err "IDE-owned BFM is active ($IDE_MARKER); stop it before re-preparing (prepare regenerates per-run creds)"
+    err "IDE-owned BFM is active ($IDE_MARKER); stop it before re-preparing"
     return 1
   fi
   if [ -f "$PIDS_FILE" ] && pids_alive "$PIDS_FILE"; then
@@ -489,12 +483,8 @@ cmd_prepare() {
 
   mkdir -p "$RUN_DIR" "$LOGS"
   local launch_id="fast-$(date +%s)-$$-$RANDOM"
-  local pguser="bfm_fast" minipg_user="minipg_fast"
-  local pgpass minipg_pass
-  pgpass="$(rand_hex)"; minipg_pass="$(rand_hex)"
-  [ -n "$pgpass" ] && [ -n "$minipg_pass" ] || { err "cannot generate per-run credentials"; return 1; }
 
-  render_config "$pguser" "$pgpass" "$minipg_user" "$minipg_pass" "$launch_id" "$scenario" || return 1
+  render_config "$launch_id" "$scenario" || return 1
   redact_refresh
   printf '%s\n' "$launch_id" >"$LAUNCH_FILE"
   printf '%s\n' "$scenario" >"$SCENARIO_FILE"
@@ -506,12 +496,11 @@ cmd_prepare() {
   # (outside the run dir so `reset` keeps it). Fail-closed on download/verify.
   download_wiremock || return 1
 
-  # Fixtures: copy fixture-worker sources, substituting per-run cred tokens.
+  # Fixtures: copy fixture sources verbatim (fixed bfm/bfm creds, no tokens).
   local src="$TOOLS_DIR/fixtures/$scenario" dst="$FAST_DIR/fixtures/$scenario"
   mkdir -p "$dst"
   if [ -d "$src" ] && [ -n "$(ls -A "$src" 2>/dev/null)" ]; then
     cp -r "$src/." "$dst/"
-    substitute_fixture_tokens "$dst" "$pguser" "$pgpass" "$minipg_user" "$minipg_pass"
     note "fixtures: COPY $src -> $dst"
   else
     note "fixtures: WARN source $src missing/empty (fixture worker owns it); left $dst empty"
