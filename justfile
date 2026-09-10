@@ -55,10 +55,10 @@ local-verify:
     @python3 -c "import json,sys; d=json.load(open('{{ state }}')); assert isinstance(d.get('clusterServers'), list) and d['clusterServers'], 'clusterServers missing/empty'; print('OK state valid JSON with clusterServers: {{ state }}')" || (echo "FAIL: STATE not valid JSON with clusterServers: {{ state }}" >&2; exit 1)
     @git -C "{{ justfile_directory() }}" diff --quiet HEAD -- bfm_status.json || (echo "FAIL: repo-root ./bfm_status.json modified (local runs must not touch it)" >&2; exit 1); echo "OK repo-root bfm_status.json untouched"
 
-# --- BFM fast environment (milestone 1 skeleton; see tools/fast-env/fast-env.sh) ---
+# --- BFM fast environment (v1: healthy + unreachable-primary, see tools/fast-env/fast-env.sh) ---
 # Primary loop is IDE-owned BFM: fast-prepare -> fast-start-dependencies ->
 # F5 "BFM — fast environment" -> fast-validate-dependencies.
-# fast-start / fast-validate are helper-owned-BFM wrappers (milestone 2).
+# fast-start / fast-validate are helper-owned-BFM wrappers (green in v1).
 fast_env_sh := justfile_directory() + "/tools/fast-env/fast-env.sh"
 
 fast-prepare scenario="healthy":

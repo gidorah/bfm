@@ -125,12 +125,23 @@ else
 fi
 MUSER="$(grep -E '^[[:space:]]*minipg\.username[[:space:]]*=' "$FAST_DIR/application.properties" | sed 's/.*=[[:space:]]*//')"
 MPASS="$(grep -E '^[[:space:]]*minipg\.password[[:space:]]*=' "$FAST_DIR/application.properties" | sed 's/.*=[[:space:]]*//')"
-C1="$(http_code "http://127.0.10.11:7779/pgstatus" "$MUSER:$MPASS")"
-C2="$(http_code "http://127.0.10.12:7779/pgstatus" "$MUSER:$MPASS")"
+C1="$(http_code "http://127.0.10.11:7779/minipg/pgstatus" "$MUSER:$MPASS")"
+C2="$(http_code "http://127.0.10.12:7779/minipg/pgstatus" "$MUSER:$MPASS")"
 if [ -n "$C1" ] && [ "$C1" != "000" ] && [ -n "$C2" ] && [ "$C2" != "000" ]; then
   ok "WireMock minipg answers HTTP per node ($C1/$C2)"
 else
   bad "WireMock minipg answers HTTP per node ($C1/$C2)"
+fi
+# Live routing proof at the HTTP seam (exact fixture URL /minipg/pgstatus):
+# each node body must carry its own IP only (no cross-node mixing, no secrets logged).
+B1="$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy curl --noproxy '*' --max-time 5 -s -u "$MUSER:$MPASS" "http://127.0.10.11:7779/minipg/pgstatus" 2>/dev/null || true)"
+B2="$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy curl --noproxy '*' --max-time 5 -s -u "$MUSER:$MPASS" "http://127.0.10.12:7779/minipg/pgstatus" 2>/dev/null || true)"
+if [ -n "$B1" ] && [ -n "$B2" ] \
+  && printf '%s' "$B1" | grep -qF "127.0.10.11" && ! printf '%s' "$B1" | grep -qF "127.0.10.12" \
+  && printf '%s' "$B2" | grep -qF "127.0.10.12" && ! printf '%s' "$B2" | grep -qF "127.0.10.11"; then
+  ok "WireMock per-node bodies carry distinct markers (no cross-node mixing)"
+else
+  bad "WireMock per-node bodies carry distinct markers (no cross-node mixing)"
 fi
 if [ -d "$FAST_DIR/wiremock-127.0.10.11/mappings" ] && [ -d "$FAST_DIR/wiremock-127.0.10.12/mappings" ] \
   && [ -n "$(ls -A "$FAST_DIR/wiremock-127.0.10.11/mappings" 2>/dev/null)" ]; then
@@ -173,6 +184,76 @@ if setsid bash "$HELPER" stop > /dev/null 2>&1; then
   fi
 else
   bad "stop works across process groups (setsid stop refused)"
+fi
+
+# --- 4d. split-shell two-launcher pgid SET (shell A launches, B relaunches one, C stops) ---
+# Reproduces the documented multi-shell `just` path without booting BFM:
+# shell A `start-dependencies` launches stubs (pgid-A); one stub is killed to
+# force shell B (`setsid start-dependencies`) to actually launch a replacement
+# (pgid-B). Uniform single-pgid ownership loses A here; the pgid SET must keep
+# both so shell C (`setsid stop`) still works. Foreign pgids stay refused.
+bash "$HELPER" start-dependencies > /dev/null 2>&1
+OWNER_A_2L="$(grep -E '^pgid=' "$FAST_DIR/.owner" 2>/dev/null | cut -d= -f2- | head -n 1)"
+VICTIM_PID_2L="$(head -n 1 "$FAST_DIR/.pids" 2>/dev/null || true)"
+if [ -n "${VICTIM_PID_2L:-}" ]; then kill "$VICTIM_PID_2L" 2>/dev/null || true; fi
+DEADLINE=$((SECONDS + 15))
+while (( SECONDS < DEADLINE )) && tuple_up 127.0.10.11 5432; do sleep 0.5; done
+if tuple_up 127.0.10.11 5432; then
+  bad "split-shell setup freed one stub tuple for relaunch"
+else
+  ok "split-shell setup freed one stub tuple for relaunch"
+fi
+if setsid bash "$HELPER" start-dependencies > /dev/null 2>&1; then
+  ok "second launcher start-dependencies exits 0"
+else
+  bad "second launcher start-dependencies exits 0"
+fi
+NEW_PID_2L="$(tail -n 1 "$FAST_DIR/.pids" 2>/dev/null || true)"
+PGID_B_2L="$(ps -o pgid= -p "$NEW_PID_2L" 2>/dev/null | tr -d ' ' || true)"
+if [ -n "$OWNER_A_2L" ] && [ -n "$PGID_B_2L" ] && [ "$OWNER_A_2L" != "$PGID_B_2L" ]; then
+  ok "two launchers have distinct pgids ($OWNER_A_2L vs $PGID_B_2L)"
+else
+  bad "two launchers have distinct pgids (A=$OWNER_A_2L B=$PGID_B_2L newpid=$NEW_PID_2L)"
+fi
+if grep -Eq "^pgid=$OWNER_A_2L$" "$FAST_DIR/.owner" 2>/dev/null && grep -Eq "^pgid=$PGID_B_2L$" "$FAST_DIR/.owner" 2>/dev/null; then
+  ok "owner pgid set contains both launchers"
+else
+  bad "owner pgid set contains both launchers (want $OWNER_A_2L + $PGID_B_2L in .owner)"
+fi
+# Foreign-group pid in SET context must still be refused + not killed.
+# Minimal file crafting (commented): simulate a foreign pid by appending a
+# setsid-launched disposable sleep (pgid outside the set) to PIDS_FILE.
+setsid sleep 60 &
+FOREIGN_SET_PID=$!
+echo "$FOREIGN_SET_PID" >> "$FAST_DIR/.pids"
+if bash "$HELPER" stop > /dev/null 2>&1; then
+  bad "stop refuses foreign-group pid in pgid-set context"
+else
+  ok "stop refuses foreign-group pid in pgid-set context"
+fi
+if kill -0 "$FOREIGN_SET_PID" 2>/dev/null; then
+  ok "stop does not kill foreign-group pid in pgid-set context (fail-closed)"
+else
+  bad "stop does not kill foreign-group pid in pgid-set context (fail-closed)"
+fi
+# The disposable sleep is not helper-owned, so drop its crafted line and reap it manually.
+grep -vxF "$FOREIGN_SET_PID" "$FAST_DIR/.pids" > "$FAST_DIR/.pids.tmp" 2>/dev/null || true
+mv -f "$FAST_DIR/.pids.tmp" "$FAST_DIR/.pids" 2>/dev/null || true
+kill "$FOREIGN_SET_PID" 2>/dev/null || true
+wait "$FOREIGN_SET_PID" 2>/dev/null || true
+if setsid bash "$HELPER" stop > /dev/null 2>&1; then
+  DEADLINE=$((SECONDS + 25))
+  while (( SECONDS < DEADLINE )) && { tuple_up 127.0.10.11 5432 || tuple_up 127.0.10.12 5433 || tuple_up 127.0.10.11 7779 || tuple_up 127.0.10.12 7779; }; do sleep 0.5; done
+  if tuple_up 127.0.10.11 5432 || tuple_up 127.0.10.12 5433 || tuple_up 127.0.10.11 7779 || tuple_up 127.0.10.12 7779; then
+    bad "cross-shell stop tears down two-launcher pgid set (stubs still up)"
+  else
+    ok "cross-shell stop tears down two-launcher pgid set"
+  fi
+else
+  bad "cross-shell stop works with two-launcher pgid set (setsid stop refused)"
+  if [ -f "$FAST_DIR/.pids" ]; then while read -r p; do kill "$p" 2>/dev/null || true; done < "$FAST_DIR/.pids"; rm -f "$FAST_DIR/.pids"; fi
+  DEADLINE=$((SECONDS + 25))
+  while (( SECONDS < DEADLINE )) && { tuple_up 127.0.10.11 5432 || tuple_up 127.0.10.12 5433 || tuple_up 127.0.10.11 7779 || tuple_up 127.0.10.12 7779; }; do sleep 0.5; done
 fi
 
 # --- 4c. IPv4-mapped IPv6 detection (Java dual-stack regression) ---------------
@@ -429,6 +510,108 @@ if grep -Eq '^_work-tmp/local/$' "$REPO_ROOT/.gitignore"; then
   ok ".gitignore keeps _work-tmp/local/"
 else
   bad ".gitignore keeps _work-tmp/local/"
+fi
+
+# --- 15b. unreachable-primary scenario ---------------------------------------
+if bash "$HELPER" prepare unreachable-primary > /dev/null 2>&1; then
+  ok "prepare accepts unreachable-primary"
+else
+  bad "prepare accepts unreachable-primary"
+fi
+[ "$(cat "$FAST_DIR/.scenario" 2>/dev/null)" = "unreachable-primary" ] \
+  && ok "prepare records .scenario=unreachable-primary" \
+  || bad "prepare records .scenario=unreachable-primary"
+if [ -f "$FAST_DIR/fixtures/unreachable-primary/pgwire-node2.json" ] \
+  && [ ! -f "$FAST_DIR/fixtures/unreachable-primary/pgwire-node1.json" ] \
+  && [ -d "$FAST_DIR/fixtures/unreachable-primary/minipg-node1" ] \
+  && [ -d "$FAST_DIR/fixtures/unreachable-primary/minipg-node2" ]; then
+  ok "prepare copies unreachable-primary layout (replica only, both minipgs, no pgwire-node1)"
+else
+  bad "prepare copies unreachable-primary layout (replica only, both minipgs, no pgwire-node1)"
+fi
+PGLIST_U="$(grep -E '^[[:space:]]*server\.pglist[[:space:]]*=' "$FAST_DIR/application.properties" | sed 's/.*=[[:space:]]*//')"
+if [ "$PGLIST_U" = "127.0.10.11:5432,127.0.10.12:5433" ]; then
+  ok "unreachable-primary keeps identical topology (server.pglist)"
+else
+  bad "unreachable-primary keeps identical topology (server.pglist, got '$PGLIST_U')"
+fi
+if bash "$HELPER" prepare bogus-scenario-xyz > /dev/null 2>&1; then
+  bad "prepare still rejects bogus scenario"
+else
+  ok "prepare still rejects bogus scenario"
+fi
+if bash "$HELPER" start-dependencies > /dev/null 2>&1; then
+  ok "unreachable-primary start-dependencies exits 0"
+else
+  bad "unreachable-primary start-dependencies exits 0"
+fi
+if tuple_up 127.0.10.11 5432; then
+  bad "unreachable-primary leaves 127.0.10.11:5432 free (absence is the point)"
+else
+  ok "unreachable-primary leaves 127.0.10.11:5432 free (absence is the point)"
+fi
+if tuple_up 127.0.10.12 5433 && tuple_up 127.0.10.11 7779 && tuple_up 127.0.10.12 7779; then
+  ok "unreachable-primary starts replica pgwire + both minipgs"
+else
+  bad "unreachable-primary starts replica pgwire + both minipgs"
+fi
+STATUS_U_OUT="$(mktemp)"
+bash "$HELPER" status >"$STATUS_U_OUT" 2>/dev/null
+if grep -q "scenario=unreachable-primary" "$STATUS_U_OUT" \
+  && grep -q "tuple 127.0.10.11:5432: free" "$STATUS_U_OUT"; then
+  ok "status shows scenario + per-tuple free"
+else
+  bad "status shows scenario + per-tuple free (see $STATUS_U_OUT)"
+fi
+VAL_U_OUT="$(mktemp)"
+if bash "$HELPER" validate-dependencies >"$VAL_U_OUT" 2>&1; then
+  bad "unreachable-primary validate-dependencies requires BFM evidence (fails when BFM absent)"
+else
+  if grep -qiE "BFM.*not listening|BFM evidence" "$VAL_U_OUT"; then
+    ok "unreachable-primary validate-dependencies requires BFM evidence (fails when BFM absent)"
+  else
+    bad "unreachable-primary validate-dependencies requires BFM evidence (fails when BFM absent; no clear BFM message)"
+  fi
+fi
+bash "$HELPER" stop > /dev/null 2>&1
+DEADLINE=$((SECONDS + 25))
+while (( SECONDS < DEADLINE )) && { tuple_up 127.0.10.12 5433 || tuple_up 127.0.10.11 7779 || tuple_up 127.0.10.12 7779; }; do sleep 0.5; done
+if tuple_up 127.0.10.12 5433 || tuple_up 127.0.10.11 7779 || tuple_up 127.0.10.12 7779; then
+  bad "unreachable-primary stop tears down helper-owned stubs"
+else
+  ok "unreachable-primary stop tears down helper-owned stubs"
+fi
+
+# --- 15c. unreachable-primary attempt evidence requires REAL attempt (no tautology) ---
+# INACCESSIBLE is already a mandatory observation line, so the attempt
+# disjunction must NOT contain it (else it passes with zero attempt).
+ATTEMPT_LINES="$(grep -E "Master Server start result" "$HELPER" || true)"
+if [ -n "$ATTEMPT_LINES" ] && ! printf '%s' "$ATTEMPT_LINES" | grep -q "INACCESSIBLE"; then
+  ok "attempt evidence excludes tautological INACCESSIBLE"
+else
+  bad "attempt evidence excludes tautological INACCESSIBLE (attempt pattern must not contain INACCESSIBLE)"
+fi
+if printf '%s' "$ATTEMPT_LINES" | grep -qF "Error on Master Server start error:" \
+  && printf '%s' "$ATTEMPT_LINES" | grep -qF "Failover Started" \
+  && printf '%s' "$ATTEMPT_LINES" | grep -qF "promote sent to" \
+  && printf '%s' "$ATTEMPT_LINES" | grep -qF "Master Server start result"; then
+  ok "attempt evidence requires real attempt lines (result + error + Failover + promote)"
+else
+  bad "attempt evidence requires real attempt lines (result + error + Failover + promote)"
+fi
+
+# --- 15d. minipg routing proves per-node distinct bodies (no cross-node mixing) ---
+# Fixtures map GET /minipg/pgstatus (see fixtures/healthy/minipg-node1/pgstatus.json)
+# to canned per-node bodies; validate must fetch both nodes proxy-bypassed with
+# CONFIG minipg creds and assert distinct markers (fail-closed).
+if grep -qF "minipg routing: distinct node markers OK" "$HELPER" \
+  && grep -qF "/minipg/pgstatus" "$HELPER"; then
+  ok "validate asserts distinct minipg node markers via /minipg/pgstatus"
+else
+  bad "validate asserts distinct minipg node markers via /minipg/pgstatus (want routing OK + /minipg/pgstatus in $HELPER)"
+fi
+if grep -q "127.0.10.11" "$HELPER" && grep -q "127.0.10.12" "$HELPER"; then
+  : # topology markers present (checked in detail by the routing assertion above)
 fi
 
 # --- 16. reset lifecycle + hermeticity -----------------------------------------

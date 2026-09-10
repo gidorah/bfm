@@ -1,0 +1,15 @@
+{
+  "request": {
+    "method": "GET",
+    "url": "/minipg/checkpoint",
+    "headers": {
+      "Authorization": {
+        "matches": "Basic .+"
+      }
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": "OK checkpoint node=127.0.10.12"
+  }
+}

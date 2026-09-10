@@ -1,0 +1,15 @@
+{
+  "request": {
+    "method": "POST",
+    "url": "/minipg/updatepgpass",
+    "headers": {
+      "Authorization": {
+        "matches": "Basic .+"
+      }
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": "OK pgpass-updated node=127.0.10.11"
+  }
+}

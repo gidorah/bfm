@@ -1,0 +1,15 @@
+{
+  "request": {
+    "method": "GET",
+    "url": "/minipg/status",
+    "headers": {
+      "Authorization": {
+        "matches": "Basic .+"
+      }
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": "OK status node=127.0.10.12 role=replica"
+  }
+}

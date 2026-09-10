@@ -1,0 +1,15 @@
+{
+  "request": {
+    "method": "GET",
+    "url": "/minipg/vip-down",
+    "headers": {
+      "Authorization": {
+        "matches": "Basic .+"
+      }
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": "OK vip-down node=127.0.10.12"
+  }
+}

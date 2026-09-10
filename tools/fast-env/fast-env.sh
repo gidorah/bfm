@@ -45,21 +45,26 @@
 # stub-tuple liveness + fixture bytes are mandatory AND BFM evidence is
 # mandatory (no deps-only green): the IDE/helper-owned BFM must be listening on
 # 127.0.0.1:9995 with /proc-proven config/CWD identity, fresh launch-id-anchored
-# logs covering the healthy background-task floor (5s checkCluster incl. per-node
-# "Status of" + "Cluster Status is " + "this is the active bfm pair", 11s
-# amIMasterBfm "no bfm cluster pair" + 11s VIP "VIP Network Check result:",
-# 9s-initial "postgresql.auto.conf clean started on ", 30s ".pgpass check &
-# update started on server :"; 6s fixappname + 7s checkUnavailable are
-# silent-by-design when healthy so their opportunity is proven via the longer
-# intervals, not a positive line), bfm_status.json HEALTHY + MASTER/SLAVE roles
-# with retry-on-truncated-write, and real active/no-pair discovery (pairStatus
+# logs, per-scenario state, and real active/no-pair discovery (pairStatus
 # starts "Active", so the no-pair/active lines are required, not just startup).
-# Stored-log redaction is fail-closed (secrets in stored logs => fail).
+# Per scenario:
+#   healthy = full floor (5s checkCluster per-node "Status of" + "Cluster Status
+#   is " + "this is the active bfm pair", 11s amIMasterBfm "no bfm cluster pair"
+#   + 11s VIP "VIP Network Check result:", 9s-initial "postgresql.auto.conf clean
+#   started on ", 30s ".pgpass check & update started on server :"; 6s fixappname
+#   + 7s checkUnavailable silent-by-design, opportunity proven via longer
+#   intervals) + bfm_status.json HEALTHY MASTER/SLAVE with retry-on-truncated-write.
+#   unreachable-primary = 127.0.10.11:5432 DOWN (TCP must FAIL) + other 3 UP;
+#   logs show INACCESSIBLE/SLAVE observation + REAL attempt evidence (Failover
+#   Started / promote sent to / Master Server start result / Error on Master
+#   Server start error:, never bare INACCESSIBLE); state absent-or-stale accepted,
+#   fresh state must show INACCESSIBLE/SLAVE, NEVER HEALTHY; VIP line not required
+#   without observable MASTER. Stored-log redaction is fail-closed.
 #
 # Safety (bfm4patroni parity, BFM-concrete): explicit 127.0.0.1 bind, tuple-aware
 # occupancy incl. wildcard listeners, proxy bypass on every probe, pre-storage
 # log redaction (fail-closed), canonical-path + symlink refusal, PID/group
-# ownership enforcement (OWNER pgid checked on stop/reset, never just stored),
+# ownership enforcement (OWNER pgid SET checked on stop/reset, never just stored),
 # reset refusal while IDE-owned BFM is active, refusal of external
 # spring/JVM/MAVEN overrides and of the BFM deployment path
 # (/etc/bfm/bfmwatcher/application.properties). Never touches repo-root
@@ -224,7 +229,7 @@ refuse_overrides() {
 # Mirrors bfm4patroni tools/local-regression download/verify mechanism.
 verify_wiremock_jar() {
   [ -f "$WIREMOCK_JAR" ] \
-    || { err "WireMock $WIREMOCK_VERSION not prepared at $WIREMOCK_JAR (run '$0 prepare healthy' first)"; return 1; }
+    || { err "WireMock $WIREMOCK_VERSION not prepared at $WIREMOCK_JAR (run '$0 prepare [healthy|unreachable-primary]' first)"; return 1; }
   local got
   got="$(sha256sum "$WIREMOCK_JAR" 2>/dev/null | awk '{ print $1 }')"
   [ "$got" = "$WIREMOCK_SHA256" ] \
@@ -262,42 +267,75 @@ download_wiremock() {
   return 0
 }
 
-# --- PID/group ownership ----------------------------------------------------------
-# OWNER_FILE is written by `prepare` and refreshed by `start-dependencies` /
-# `start` (whichever shell actually launches processes). Each just recipe runs
-# in its own shell/process-group, so the prepare-time pgid is stale by stop
-# time; ownership must describe the launching shell. stop/reset CHECK the
-# recorded pgid against live truth, never just trust the dir line.
+# --- PID/group ownership (pgid SET) ---------------------------------------------------
+# OWNER_FILE holds dir=/pid=/date= plus one pgid= line per launching shell.
+# `prepare` initializes the set with the current pgid; `start-dependencies`
+# appends only when IT launches processes (pure-adopt preserves); `start`
+# always appends since it launches BFM. Each just recipe runs in its own
+# shell/process-group, so a single pgid cannot survive the documented
+# multi-shell path (start-dependencies in shell A, start in shell B, stop in
+# shell C). stop/reset CHECK every alive helper pid's live pgid is IN the
+# recorded set, never just trust the dir line. Tolerant read: an old file
+# with only pgid=<n> counts as a one-element set.
 # Fail-closed: refuse to kill/delete when the group cannot be proven, so a
 # foreign or tampered PIDS file can never cause us to kill foreign PIDs.
-write_owner() { # (re)stamp ownership of FAST_DIR to this shell
+write_owner() { # initialize ownership of FAST_DIR to this shell (pgid set := {current})
   printf 'dir=%s\npid=%s\npgid=%s\ndate=%s\n' \
     "$(canonical "$FAST_DIR")" "$$" "$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')" "$(date -u '+%FT%TZ')" >"$OWNER_FILE"
+  chmod 600 "$OWNER_FILE" 2>/dev/null || true
+}
+owner_append() { # append current pgid to the owner set (dedupe; refresh pid/date)
+  local cur_pgid canon existing merged _pg
+  cur_pgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')"
+  case "$cur_pgid" in ''|*[!0-9]*) err "cannot determine current pgid (refusing append)"; return 1;; esac
+  canon="$(canonical "$FAST_DIR")"
+  existing=""
+  if [ -f "$OWNER_FILE" ]; then
+    existing="$(grep -E '^pgid=' "$OWNER_FILE" 2>/dev/null | cut -d= -f2- || true)"
+  fi
+  merged="$(printf '%s\n%s\n' "$existing" "$cur_pgid" | grep -E '^[0-9]+$' | sort -u -n || true)"
+  [ -n "$merged" ] || { err "cannot build owner pgid set (refusing append)"; return 1; }
+  {
+    printf 'dir=%s\npid=%s\n' "$canon" "$$"
+    while IFS= read -r _pg; do
+      [ -n "$_pg" ] || continue
+      printf 'pgid=%s\n' "$_pg"
+    done <<<"$merged"
+    printf 'date=%s\n' "$(date -u '+%FT%TZ')"
+  } >"$OWNER_FILE"
   chmod 600 "$OWNER_FILE" 2>/dev/null || true
 }
 check_owner() { # check_owner <op>
   local op="${1:-stop}"
   [ -f "$OWNER_FILE" ] || return 0
-  local owner_dir owner_pid owner_pgid
+  local owner_dir owner_pid owner_pgid_lines
   owner_dir="$(grep -E '^dir=' "$OWNER_FILE" 2>/dev/null | cut -d= -f2-)"
   owner_pid="$(grep -E '^pid=' "$OWNER_FILE" 2>/dev/null | cut -d= -f2-)"
-  owner_pgid="$(grep -E '^pgid=' "$OWNER_FILE" 2>/dev/null | cut -d= -f2-)"
+  owner_pgid_lines="$(grep -E '^pgid=' "$OWNER_FILE" 2>/dev/null | cut -d= -f2- || true)"
   [ -n "$owner_dir" ] \
     || { err "ownership file $OWNER_FILE missing dir (refusing $op)"; return 1; }
   [ "$owner_dir" = "$(canonical "$FAST_DIR")" ] \
     || { err "ownership mismatch ($OWNER_FILE points at '$owner_dir'); refusing to $op"; return 1; }
   case "$owner_pid" in ''|*[!0-9]*) err "ownership file $OWNER_FILE has invalid pid '$owner_pid' (refusing $op)"; return 1;; esac
-  case "$owner_pgid" in ''|*[!0-9]*) err "ownership file $OWNER_FILE has invalid pgid '$owner_pgid' (refusing $op)"; return 1;; esac
-  # When the launching pid is still alive, its live pgid must match the record.
+  [ -n "$owner_pgid_lines" ] \
+    || { err "ownership file $OWNER_FILE has invalid pgid '' (refusing $op)"; return 1; }
+  local _pg set_display
+  while IFS= read -r _pg; do
+    case "$_pg" in ''|*[!0-9]*) err "ownership file $OWNER_FILE has invalid pgid '$_pg' (refusing $op)"; return 1;; esac
+  done <<<"$owner_pgid_lines"
+  set_display="$(printf '%s\n' "$owner_pgid_lines" | paste -sd, - | sed 's/,/, /g')"
+  # When the launching pid is still alive, its live pgid must be IN the set.
   if kill -0 "$owner_pid" 2>/dev/null; then
     local live_pgid
     live_pgid="$(ps -o pgid= -p "$owner_pid" 2>/dev/null | tr -d ' ')"
     [ -n "$live_pgid" ] \
       || { err "cannot prove owner pid=$owner_pid group (refusing $op)"; return 1; }
-    [ "$live_pgid" = "$owner_pgid" ] \
-      || { err "ownership group mismatch (owner pid=$owner_pid live pgid=$live_pgid != recorded pgid=$owner_pgid; refusing $op)"; return 1; }
+    if ! printf '%s\n' "$owner_pgid_lines" | grep -Fxq "$live_pgid"; then
+      err "ownership group mismatch (owner pid=$owner_pid live pgid=$live_pgid not in recorded pgid set [$set_display]; refusing $op)"
+      return 1
+    fi
   fi
-  # Helper-owned pids must belong to the recorded group while alive.
+  # Helper-owned pids must belong to the recorded SET while alive.
   local f p actual
   for f in "$PIDS_FILE" "$HELPER_BFM_PID"; do
     [ -f "$f" ] || continue
@@ -307,8 +345,10 @@ check_owner() { # check_owner <op>
       actual="$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ')"
       [ -n "$actual" ] \
         || { err "cannot prove helper pid=$p group (refusing $op)"; return 1; }
-      [ "$actual" = "$owner_pgid" ] \
-        || { err "helper pid=$p pgid=$actual outside owner pgid=$owner_pgid (refusing $op; foreign pid?)"; return 1; }
+      if ! printf '%s\n' "$owner_pgid_lines" | grep -Fxq "$actual"; then
+        err "helper pid=$p pgid=$actual outside owner pgid set [$set_display] (refusing $op; foreign pid?)"
+        return 1
+      fi
     done <"$f"
   done
   return 0
@@ -481,8 +521,10 @@ cmd_prepare() {
   local scenario="${1:-healthy}"
   refuse_overrides || return 1
   guard_paths || return 1
-  [ "$scenario" = "healthy" ] \
-    || { err "unknown scenario '$scenario' (v1 supports only 'healthy')"; return 1; }
+  case "$scenario" in
+    healthy|unreachable-primary) ;;
+    *) err "unknown scenario '$scenario' (v1 supports only 'healthy' and 'unreachable-primary')"; return 1;;
+  esac
   if [ -f "$IDE_MARKER" ]; then
     err "IDE-owned BFM is active ($IDE_MARKER); stop it before re-preparing"
     return 1
@@ -548,18 +590,31 @@ PGWIRE_STUB="$TOOLS_DIR/pgwire-stub.py"
 PGWIRE_FIX1="pgwire-node1.json"
 PGWIRE_FIX2="pgwire-node2.json"
 
-ensure_pgwire() { # ensure_pgwire <ip> <port> <fixture-name>
-  local ip="$1" port="$2" fixture="$3"
+# Scenario owning this run (from .scenario, fallback healthy for runs
+# prepared before scenarios existed). Only healthy|unreachable-primary.
+current_scenario() {
+  local s="healthy"
+  if [ -f "$SCENARIO_FILE" ]; then
+    s="$(cat "$SCENARIO_FILE" 2>/dev/null || echo healthy)"
+  fi
+  case "$s" in
+    healthy|unreachable-primary) printf '%s' "$s";;
+    *) printf 'healthy';;
+  esac
+}
+
+ensure_pgwire() { # ensure_pgwire <ip> <port> <fixture-name> [scenario]
+  local ip="$1" port="$2" fixture="$3" scenario="${4:-healthy}"
   if tuple_listening "$ip" "$port"; then
     note "stub tuple $ip:$port: LISTENING (externally owned; adopted)"
     return 0
   fi
   [ -f "$PGWIRE_STUB" ] \
     || { err "stub tuple $ip:$port is free and $PGWIRE_STUB is missing"; return 1; }
-  local fix="$FAST_DIR/fixtures/healthy/$fixture"
-  [ -f "$fix" ] || fix="$TOOLS_DIR/fixtures/healthy/$fixture"
+  local fix="$FAST_DIR/fixtures/$scenario/$fixture"
+  [ -f "$fix" ] || fix="$TOOLS_DIR/fixtures/$scenario/$fixture"
   [ -f "$fix" ] \
-    || { err "stub tuple $ip:$port is free and pgwire fixture $fixture is missing (run '$0 prepare healthy' first)"; return 1; }
+    || { err "stub tuple $ip:$port is free and pgwire fixture $fixture is missing (run '$0 prepare $scenario' first)"; return 1; }
   local logf="$LOGS/stub-pgwire-$ip-$port.log" pid
   : >"$logf"
   chmod 600 "$logf" 2>/dev/null || true
@@ -576,8 +631,8 @@ ensure_pgwire() { # ensure_pgwire <ip> <port> <fixture-name>
   return 1
 }
 
-ensure_minipg() { # ensure_minipg <ip> <node-dir-name>
-  local ip="$1" nodedir="$2"
+ensure_minipg() { # ensure_minipg <ip> <node-dir-name> [scenario]
+  local ip="$1" nodedir="$2" scenario="${3:-healthy}"
   if tuple_listening "$ip" "$MINIPG_PORT"; then
     note "stub tuple $ip:$MINIPG_PORT: LISTENING (externally owned; adopted)"
     return 0
@@ -585,11 +640,11 @@ ensure_minipg() { # ensure_minipg <ip> <node-dir-name>
   verify_wiremock_jar || return 1
   command -v java >/dev/null 2>&1 \
     || { err "stub tuple $ip:$MINIPG_PORT is free but java is unavailable (WireMock needs Java 21)"; return 1; }
-  local srcdir="$FAST_DIR/fixtures/healthy/$nodedir"
+  local srcdir="$FAST_DIR/fixtures/$scenario/$nodedir"
   [ -d "$srcdir" ] \
-    || { err "stub tuple $ip:$MINIPG_PORT is free and mappings source $nodedir is missing (run '$0 prepare healthy' first)"; return 1; }
+    || { err "stub tuple $ip:$MINIPG_PORT is free and mappings source $nodedir is missing (run '$0 prepare $scenario' first)"; return 1; }
   [ -n "$(ls -A "$srcdir" 2>/dev/null)" ] \
-    || { err "stub tuple $ip:$MINIPG_PORT is free and mappings source $srcdir is empty (run '$0 prepare healthy' first)"; return 1; }
+    || { err "stub tuple $ip:$MINIPG_PORT is free and mappings source $srcdir is empty (run '$0 prepare $scenario' first)"; return 1; }
   # Stage a WireMock root: fixtures are flat <op>.json files, WireMock loads
   # <root>/mappings/*.json (+ __files/). Staging keeps fixture contents intact.
   local wm_root="$FAST_DIR/wiremock-$ip"
@@ -616,29 +671,46 @@ ensure_minipg() { # ensure_minipg <ip> <node-dir-name>
 cmd_start_dependencies() {
   refuse_overrides || return 1
   guard_paths || return 1
-  [ -f "$CONFIG" ] || { err "not prepared (run '$0 prepare healthy' first)"; return 1; }
+  [ -f "$CONFIG" ] || { err "not prepared (run '$0 prepare [healthy|unreachable-primary]' first)"; return 1; }
   redact_refresh
   mkdir -p "$LOGS"
   : >>"$PIDS_FILE"
   local pids_before
   pids_before="$(grep -c . "$PIDS_FILE" 2>/dev/null || true)"
 
-  local rc=0
-  ensure_pgwire "$PG1_IP" "$PG1_PORT" "$PGWIRE_FIX1" || rc=1
-  ensure_pgwire "$PG2_IP" "$PG2_PORT" "$PGWIRE_FIX2" || rc=1
-  ensure_minipg "$PG1_IP" "minipg-node1" || rc=1
-  ensure_minipg "$PG2_IP" "minipg-node2" || rc=1
+  local rc=0 scenario
+  scenario="$(current_scenario)"
+  note "start-dependencies: scenario=$scenario"
+  if [ "$scenario" = "unreachable-primary" ]; then
+    # Absence is the point: NO pgwire stub on 127.0.10.11:5432. Observation
+    # requires the tuple free, so an occupied tuple is a hard failure.
+    if tuple_listening "$PG1_IP" "$PG1_PORT"; then
+      err "stub tuple $PG1_IP:$PG1_PORT is LISTENING but scenario 'unreachable-primary' requires it FREE (absence is the point; stop whatever holds it)"
+      rc=1
+    else
+      note "stub tuple $PG1_IP:$PG1_PORT: FREE (absence is the point; not launching)"
+      log "start-dependencies pgwire $PG1_IP:$PG1_PORT absent-by-scenario"
+    fi
+    ensure_pgwire "$PG2_IP" "$PG2_PORT" "$PGWIRE_FIX2" "$scenario" || rc=1
+    ensure_minipg "$PG1_IP" "minipg-node1" "$scenario" || rc=1
+    ensure_minipg "$PG2_IP" "minipg-node2" "$scenario" || rc=1
+  else
+    ensure_pgwire "$PG1_IP" "$PG1_PORT" "$PGWIRE_FIX1" "$scenario" || rc=1
+    ensure_pgwire "$PG2_IP" "$PG2_PORT" "$PGWIRE_FIX2" "$scenario" || rc=1
+    ensure_minipg "$PG1_IP" "minipg-node1" "$scenario" || rc=1
+    ensure_minipg "$PG2_IP" "minipg-node2" "$scenario" || rc=1
+  fi
   if [ "$rc" != "0" ]; then
     err "start-dependencies: INCOMPLETE - provide the missing pieces above, then re-run (listening tuples are adopted; 'stop' tears down helper-owned stubs)"
     return 1
   fi
-  # Restamp ownership only when this invocation actually launched processes.
-  # Pure-adopt runs must preserve the existing owner, or stop/reset would
-  # refuse from every shell afterwards (the launcher’s pgid is what counts).
+  # Append to the owner pgid set only when this invocation actually launched
+  # processes. Pure-adopt runs must preserve the existing set, or stop/reset
+  # would refuse from every shell afterwards (launchers' pgids are what count).
   local pids_after
   pids_after="$(grep -c . "$PIDS_FILE" 2>/dev/null || true)"
   if [ "${pids_after:-0}" -gt "${pids_before:-0}" ]; then
-    write_owner
+    owner_append
   fi
   log "start-dependencies: all stub tuples listening"
   note "start-dependencies: all stub tuples listening"
@@ -648,16 +720,26 @@ cmd_start_dependencies() {
 # --- validate-dependencies -------------------------------------------------------
 # BFM evidence is MANDATORY (no deps-only green): stubs + fixtures + BFM
 # listener with /proc-proven config/CWD identity + fresh launch-id-anchored
-# logs for the healthy background-task floor + HEALTHY state. Fails when the
-# IDE/helper-owned BFM is absent or identity cannot be proven.
+# logs + state. Fails when the IDE/helper-owned BFM is absent or identity
+# cannot be proven. Per scenario:
+#   healthy: 4 tuples UP, HEALTHY MASTER/SLAVE state, full log floor.
+#   unreachable-primary: 127.0.10.11:5432 DOWN (absence is the point; TCP
+#     connect must FAIL), other 3 UP; logs must show INACCESSIBLE observation
+#     + REAL attempt evidence (never bare INACCESSIBLE); cluster status is presence-only (NEVER HEALTHY: failover()
+#     ends HEALTHY unconditionally, so HEALTHY proves nothing here); state
+#     writes are gated on masterServer != null, so absent/stale state is the
+#     expected outcome and fresh state must show INACCESSIBLE + SLAVE roles.
 cmd_validate_dependencies() {
   refuse_overrides || return 1
   guard_paths || return 1
-  [ -f "$CONFIG" ] || { err "not prepared (run '$0 prepare healthy' first)"; return 1; }
+  [ -f "$CONFIG" ] || { err "not prepared (run '$0 prepare [healthy|unreachable-primary]' first)"; return 1; }
   redact_refresh
   mkdir -p "$LOGS"
   local launch_id="unknown"
   [ -f "$LAUNCH_FILE" ] && launch_id="$(cat "$LAUNCH_FILE")"
+  local scenario
+  scenario="$(current_scenario)"
+  note "validate-dependencies: scenario=$scenario (launch-id=$launch_id)"
 
   # (a) config identity: expected loopback topology, never prod values.
   local pglist
@@ -671,16 +753,39 @@ cmd_validate_dependencies() {
   case "$pglist" in 127.*) ;; *) err "refusing non-loopback pglist: $pglist"; return 1;; esac
 
   # (b) stub health: bounded polling of every tuple (TCP connect, proxy-free).
+  # unreachable-primary: 127.0.10.11:5432 must stay DOWN (absence is the
+  # point); the other 3 tuples must be UP.
   local t ip port
-  for t in $STUB_TUPLES; do
-    ip="${t%%:*}"; port="${t##*:}"
-    if poll_until "$VALIDATE_TIMEOUT_STUBS" tcp_probe "$ip" "$port"; then
-      note "stub $t: UP"
-    else
-      err "stub $t: NOT LISTENING after ${VALIDATE_TIMEOUT_STUBS}s (run '$0 start-dependencies')"
+  if [ "$scenario" = "unreachable-primary" ]; then
+    if tuple_listening "$PG1_IP" "$PG1_PORT"; then
+      err "stub $PG1_IP:$PG1_PORT: LISTENING but scenario 'unreachable-primary' requires it DOWN (absence is the point)"
       return 1
     fi
-  done
+    if tcp_probe "$PG1_IP" "$PG1_PORT"; then
+      err "stub $PG1_IP:$PG1_PORT: TCP connect unexpectedly succeeded (scenario requires DOWN)"
+      return 1
+    fi
+    note "stub $PG1_IP:$PG1_PORT: DOWN (absence is the point)"
+    for t in "$PG2_IP:$PG2_PORT" "$PG1_IP:$MINIPG_PORT" "$PG2_IP:$MINIPG_PORT"; do
+      ip="${t%%:*}"; port="${t##*:}"
+      if poll_until "$VALIDATE_TIMEOUT_STUBS" tcp_probe "$ip" "$port"; then
+        note "stub $t: UP"
+      else
+        err "stub $t: NOT LISTENING after ${VALIDATE_TIMEOUT_STUBS}s (run '$0 start-dependencies')"
+        return 1
+      fi
+    done
+  else
+    for t in $STUB_TUPLES; do
+      ip="${t%%:*}"; port="${t##*:}"
+      if poll_until "$VALIDATE_TIMEOUT_STUBS" tcp_probe "$ip" "$port"; then
+        note "stub $t: UP"
+      else
+        err "stub $t: NOT LISTENING after ${VALIDATE_TIMEOUT_STUBS}s (run '$0 start-dependencies')"
+        return 1
+      fi
+    done
+  fi
 
   # (c) minipg HTTP speaks (best-effort liveness; any HTTP status proves HTTP).
   local pguser pgpass code
@@ -689,22 +794,22 @@ cmd_validate_dependencies() {
   [ -n "$pgpass" ] && [ -n "$mpass" ] \
     || { err "cannot prove redaction: generated secrets missing in $CONFIG"; return 1; }
   for ip in "$PG1_IP" "$PG2_IP"; do
-    code="$(http_probe "http://$ip:$MINIPG_PORT/pgstatus" "$muser:$mpass" || true)"
+    code="$(http_probe "http://$ip:$MINIPG_PORT/minipg/pgstatus" "$muser:$mpass" || true)"
     if [ -n "$code" ] && [ "$code" != "000" ]; then
       note "minipg $ip:$MINIPG_PORT: HTTP $code"
     else
-      note "minipg $ip:$MINIPG_PORT: WARN no HTTP response on /pgstatus (TCP is up; fixtures may map other routes)"
+      note "minipg $ip:$MINIPG_PORT: WARN no HTTP response on /minipg/pgstatus (TCP is up; fixtures may map other routes)"
     fi
   done
 
   # (d) fixture bytes: expected content (fail-closed, no stub-only excuse).
-  local dst="$FAST_DIR/fixtures/healthy" bytes=0
+  local dst="$FAST_DIR/fixtures/$scenario" bytes=0
   if [ -d "$dst" ] && [ -n "$(ls -A "$dst" 2>/dev/null)" ]; then
     bytes="$(find "$dst" -type f -size +0c 2>/dev/null | wc -l)"
     [ "$bytes" -gt 0 ] || { err "fixtures at $dst contain no non-empty files"; return 1; }
     note "fixtures: $bytes non-empty file(s) under $dst"
   else
-    err "fixtures at $dst empty/missing (run '$0 prepare healthy' first)"
+    err "fixtures at $dst empty/missing (run '$0 prepare $scenario' first)"
     return 1
   fi
 
@@ -745,11 +850,40 @@ cmd_validate_dependencies() {
     *) err "BFM $BFM_TUPLE: /bfm/is-alive HTTP ${code:-000} after ${VALIDATE_TIMEOUT_BFM_HTTP}s (want 200 with CONFIG creds)"; return 1;;
   esac
 
-  # -- bfm_status.json: retry-on-truncated-write, expected HEALTHY + roles.
+  # -- bfm_status.json: retry-on-truncated-write.
+  # healthy: fresh HEALTHY + MASTER/SLAVE roles.
+  # unreachable-primary: status writes are gated on masterServer != null
+  # (checkLastWalPositions), which never becomes non-null here (no MASTER
+  # can be observed), so absent-or-stale state is the expected outcome. If
+  # BFM did write fresh state, it must show INACCESSIBLE + SLAVE roles.
+  # NEVER require HEALTHY: failover() ends HEALTHY unconditionally.
   note "waiting for fresh $STATE (launch-id=$launch_id) ..."
   local st_file
   st_file="$(mktemp)"
-  if ! poll_until "$VALIDATE_TIMEOUT_STATE" python3 - "$STATE" "$st_file" <<'EOF'
+  if [ "$scenario" = "unreachable-primary" ]; then
+    if [ ! -f "$STATE" ]; then
+      note "state: absent (expected: no MASTER observable, so checkLastWalPositions never writes)"
+    elif [ "$STATE" -ot "$LAUNCH_FILE" ]; then
+      note "state: stale (older than launch-id $launch_id; expected: BFM never rewrites without an observable MASTER)"
+    else
+      if ! poll_until "$VALIDATE_TIMEOUT_STATE" python3 - "$STATE" "$st_file" <<'EOF'
+import json, sys
+state, out = sys.argv[1], sys.argv[2]
+d = json.load(open(state))  # raises on truncated/partial write -> poll retries
+got = {s["address"]: s.get("databaseStatus") for s in d.get("clusterServers", [])}
+assert set(got) == {"127.0.10.11:5432", "127.0.10.12:5433"}, got
+assert sorted(got.values()) == ["INACCESSIBLE", "SLAVE"], got
+open(out, "w").write(json.dumps({"clusterStatus": d.get("clusterStatus"), "roles": got}, sort_keys=True))
+EOF
+      then
+        err "state check failed after ${VALIDATE_TIMEOUT_STATE}s: fresh state must show 127.0.10.11:5432=INACCESSIBLE + 127.0.10.12:5433=SLAVE (tolerant of truncated rewrites; see $STATE)"
+        rm -f "$st_file"
+        return 1
+      fi
+      note "state: fresh roles=$(cat "$st_file") (any clusterStatus accepted; HEALTHY is never success evidence here)"
+    fi
+  else
+    if ! poll_until "$VALIDATE_TIMEOUT_STATE" python3 - "$STATE" "$st_file" <<'EOF'
 import json, sys
 state, out = sys.argv[1], sys.argv[2]
 d = json.load(open(state))  # raises on truncated/partial write -> poll retries
@@ -759,18 +893,19 @@ assert set(got) == {"127.0.10.11:5432", "127.0.10.12:5433"}, got
 assert sorted(got.values()) == ["MASTER", "SLAVE"], got
 open(out, "w").write(json.dumps(got, sort_keys=True))
 EOF
-  then
-    err "state check failed after ${VALIDATE_TIMEOUT_STATE}s: want clusterStatus=HEALTHY with 127.0.10.11:5432 + 127.0.10.12:5433 as MASTER/SLAVE (tolerant of truncated rewrites; see $STATE)"
-    rm -f "$st_file"
-    return 1
+    then
+      err "state check failed after ${VALIDATE_TIMEOUT_STATE}s: want clusterStatus=HEALTHY with 127.0.10.11:5432 + 127.0.10.12:5433 as MASTER/SLAVE (tolerant of truncated rewrites; see $STATE)"
+      rm -f "$st_file"
+      return 1
+    fi
+    # Freshness: state must be newer than this launch (prepare deletes stale state).
+    if [ "$STATE" -ot "$LAUNCH_FILE" ]; then
+      err "stale $STATE (older than launch-id $launch_id); restart BFM on the current CONFIG"
+      rm -f "$st_file"
+      return 1
+    fi
+    note "state: HEALTHY roles=$(cat "$st_file")"
   fi
-  # Freshness: state must be newer than this launch (prepare deletes stale state).
-  if [ "$STATE" -ot "$LAUNCH_FILE" ]; then
-    err "stale $STATE (older than launch-id $launch_id); restart BFM on the current CONFIG"
-    rm -f "$st_file"
-    return 1
-  fi
-  note "state: HEALTHY roles=$(cat "$st_file")"
   rm -f "$st_file"
 
   # -- fresh BFM log evidence anchored by launch id (bounded polling).
@@ -781,6 +916,19 @@ EOF
   # is proven via the longer intervals above, not a positive line.
   # pairStatus starts "Active", so the no-pair/active lines prove real discovery,
   # not just startup.
+  # unreachable-primary floor: INACCESSIBLE observation of 127.0.10.11:5432,
+  # presence (any value) of the replica Status + Cluster Status lines, active
+  # + no-pair discovery, 9s-initial autoconf clean, 30s pgpass update, and
+  # attempt evidence (at least one REAL attempt: Master Server start result,
+  # Error on Master Server start error:, Failover Started, promote sent to;
+  # INACCESSIBLE is excluded here because it is already a mandatory
+  # observation line above, so it would pass with zero attempt; both result
+  # + error variants are kept because live runs take the NPE path via the
+  # error line instead of the result line). The 11s VIP check line is NOT
+  # required here: checkMasterVIPNetwork only runs when a MASTER is observed,
+  # and none can be (primary absent, replica canned SLAVE). Cluster Status is
+  # presence-only: failover() ends HEALTHY unconditionally, so HEALTHY in logs
+  # is never success evidence for this scenario.
   local bfm_log="$LOGS/app.log" pat
   [ -f "$bfm_log" ] \
     || { err "BFM log $bfm_log absent (BFM must run with CWD=$run_canon so logging.file.name resolves here)"; return 1; }
@@ -788,24 +936,70 @@ EOF
     err "stale BFM log $bfm_log (older than launch-id $launch_id); restart BFM on the current CONFIG"
     return 1
   fi
-  for pat in \
-    "Cluster Status is " \
-    "Status of 127.0.10.11:5432 is " \
-    "Status of 127.0.10.12:5433 is " \
-    "this is the active bfm pair" \
-    "no bfm cluster pair" \
-    "VIP Network Check result:" \
-    "postgresql.auto.conf clean started on " \
-    ".pgpass check & update started on server :"; do
-    if poll_until "$VALIDATE_TIMEOUT_LOG" grep -qF "$pat" "$bfm_log" 2>/dev/null; then
-      note "log: found '$pat'"
+  if [ "$scenario" = "unreachable-primary" ]; then
+    for pat in \
+      "Status of 127.0.10.11:5432 is INACCESSIBLE" \
+      "Status of 127.0.10.12:5433 is " \
+      "Cluster Status is " \
+      "this is the active bfm pair" \
+      "no bfm cluster pair" \
+      "postgresql.auto.conf clean started on " \
+      ".pgpass check & update started on server :"; do
+      if poll_until "$VALIDATE_TIMEOUT_LOG" grep -qF "$pat" "$bfm_log" 2>/dev/null; then
+        note "log: found '$pat'"
+      else
+        err "log evidence missing after ${VALIDATE_TIMEOUT_LOG}s: '$pat' not in $bfm_log (launch-id=$launch_id)"
+        return 1
+      fi
+    done
+    if grep -qE "Master Server start result|Error on Master Server start error:|Failover Started|promote sent to" "$bfm_log" 2>/dev/null; then
+      note "log: attempt evidence present ($(grep -oE "Master Server start result|Error on Master Server start error:|Failover Started|promote sent to" "$bfm_log" 2>/dev/null | sort | uniq -c | tr '\n' ';'))"
     else
-      err "log evidence missing after ${VALIDATE_TIMEOUT_LOG}s: '$pat' not in $bfm_log (launch-id=$launch_id)"
+      err "log attempt evidence missing: none of 'Master Server start result' / 'Error on Master Server start error:' / 'Failover Started' / 'promote sent to' in $bfm_log"
       return 1
     fi
-  done
-  note "log: fixappname (6s) silent-by-design when app names healthy (no repair line expected; 30s pgpass proves the loop had opportunity)"
-  note "log: checkUnavailable (7s) silent-by-design when no INACCESSIBLE (no rewind line expected; VIP/pgpass prove the loop had opportunity)"
+    note "log: VIP check line not required (no MASTER observable, so checkMasterVIPNetwork never runs)"
+  else
+    for pat in \
+      "Cluster Status is " \
+      "Status of 127.0.10.11:5432 is " \
+      "Status of 127.0.10.12:5433 is " \
+      "this is the active bfm pair" \
+      "no bfm cluster pair" \
+      "VIP Network Check result:" \
+      "postgresql.auto.conf clean started on " \
+      ".pgpass check & update started on server :"; do
+      if poll_until "$VALIDATE_TIMEOUT_LOG" grep -qF "$pat" "$bfm_log" 2>/dev/null; then
+        note "log: found '$pat'"
+      else
+        err "log evidence missing after ${VALIDATE_TIMEOUT_LOG}s: '$pat' not in $bfm_log (launch-id=$launch_id)"
+        return 1
+      fi
+    done
+    note "log: fixappname (6s) silent-by-design when app names healthy (no repair line expected; 30s pgpass proves the loop had opportunity)"
+    note "log: checkUnavailable (7s) silent-by-design when no INACCESSIBLE (no rewind line expected; VIP/pgpass prove the loop had opportunity)"
+  fi
+
+  # -- minipg routing: per-node distinct bodies (fail-closed, no cross-node mixing).
+  # Fixture GET /minipg/pgstatus (see fixtures/healthy/minipg-node1/pgstatus.json
+  # for the exact URL) returns canned static text per node
+  # ("OK pgstatus node=<ip> ...", no secrets). Single proxy-bypassed GET per
+  # node with CONFIG minipg creds (stubs already polled UP); success logs only
+  # the OK line, never raw bodies. Placed after BFM evidence so a missing BFM
+  # still fails with the BFM message, not a routing message.
+  local body1 body2
+  body1="$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy curl --noproxy '*' --max-time 5 -s -u "$muser:$mpass" "http://$PG1_IP:$MINIPG_PORT/minipg/pgstatus" 2>/dev/null || true)"
+  body2="$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy curl --noproxy '*' --max-time 5 -s -u "$muser:$mpass" "http://$PG2_IP:$MINIPG_PORT/minipg/pgstatus" 2>/dev/null || true)"
+  if [ -n "$body1" ] && [ -n "$body2" ] \
+    && printf '%s' "$body1" | grep -qF "$PG1_IP" \
+    && ! printf '%s' "$body1" | grep -qF "$PG2_IP" \
+    && printf '%s' "$body2" | grep -qF "$PG2_IP" \
+    && ! printf '%s' "$body2" | grep -qF "$PG1_IP"; then
+    note "minipg routing: distinct node markers OK"
+  else
+    err "minipg routing: cross-node mixing or missing node marker (want $PG1_IP body to contain $PG1_IP only and $PG2_IP body to contain $PG2_IP only via /minipg/pgstatus with minipg creds)"
+    return 1
+  fi
 
   # -- Redaction tripwire (fail-closed): credential-bearing forms must never
   # hit stored logs. The literal password is NOT scanned: with fixed test-only
@@ -826,15 +1020,15 @@ EOF
     fi
   done
 
-  log "validate-dependencies launch=$launch_id result=full-ok"
-  note "validate-dependencies: OK (full, launch-id=$launch_id)"
+  log "validate-dependencies launch=$launch_id scenario=$scenario result=full-ok"
+  note "validate-dependencies: OK (full, scenario=$scenario, launch-id=$launch_id)"
   return 0
 }
 
 # --- status ----------------------------------------------------------------------
 cmd_status() {
   guard_paths || return 1
-  if [ ! -f "$CONFIG" ]; then note "fast-env: not prepared (run '$0 prepare healthy' first)"; return 0; fi
+  if [ ! -f "$CONFIG" ]; then note "fast-env: not prepared (run '$0 prepare [healthy|unreachable-primary]' first)"; return 0; fi
   local launch_id="unknown"
   [ -f "$LAUNCH_FILE" ] && launch_id="$(cat "$LAUNCH_FILE")"
   note "launch-id=$launch_id scenario=$(cat "$SCENARIO_FILE" 2>/dev/null || echo unknown)"
@@ -970,7 +1164,9 @@ cmd_start() {
   local p
   p="$(cd "$RUN_DIR" && launch_bg_redacted "$LOGS/bfm-helper.log" no_proxy_env nohup java -Dspring.config.location="file:$CONFIG" -jar "$jar")"
   printf '%s\n' "$p" >"$HELPER_BFM_PID"
-  write_owner
+  # `start` always launches BFM, so it always appends its pgid to the owner
+  # set (idempotent when start-dependencies already appended the same pgid).
+  owner_append
   log "start helper-owned BFM pid=$p jar=$jar"
   note "helper-owned BFM starting pid=$p (logs: $LOGS/bfm-helper.log, $LOGS/app.log)"
   return 0
@@ -991,7 +1187,7 @@ usage() {
   cat <<EOF
 Usage: $(basename "$0") <command> [args]
 
-  prepare [healthy]       generate config/run/logs + copy fixtures + verify WireMock cache (v1: healthy only)
+  prepare [healthy|unreachable-primary]       generate config/run/logs + copy fixtures + verify WireMock cache
   start-dependencies      adopt or launch pgwire stubs + per-IP WireMock JVMs on the 4 stub tuples
   validate-dependencies   bounded-poll validation (deps + BFM evidence REQUIRED; fails when BFM absent)
   status                  show tuples, pids, config, state summary (read-only)

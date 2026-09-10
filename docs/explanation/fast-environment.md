@@ -79,6 +79,10 @@ active/no-pair discovery (`pairStatus` starts `"Active"`), IDE-case
 config/CWD identity check (a listener on 9995 alone is insufficient),
 loopback-only fail-closed behaviour, redaction, and disposable-state
 invariants.
+Per scenario: `healthy` is `HEALTHY` `MASTER`/`SLAVE` with the full log floor;
+`unreachable-primary` is absent-or-stale state (fresh must be `INACCESSIBLE`/`SLAVE`,
+never `HEALTHY`) with no `VIP Network Check` line without an observable `MASTER`.
+Deferred slices are tracked in #17.
 
 Safety (bfm4patroni parity, BFM-concrete): explicit `127.0.0.1` bind,
 tuple-aware occupancy, proxy bypass, fast-only logging config with

@@ -1,0 +1,15 @@
+{
+  "request": {
+    "method": "GET",
+    "url": "/minipg/pgstatus",
+    "headers": {
+      "Authorization": {
+        "matches": "Basic .+"
+      }
+    }
+  },
+  "response": {
+    "status": 200,
+    "body": "OK pgstatus node=127.0.10.11 role=primary"
+  }
+}
