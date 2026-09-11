@@ -1,6 +1,6 @@
-# bfm-live disposable stack (issue #18, part B): 2-node PostgreSQL
-# streaming-replication cluster with one compatible MiniPG agent per node,
-# where BFM owns failover.
+# bfm-live disposable stack (issue #23, part A): 2-node PostgreSQL 14
+# streaming-replication cluster with one REAL minipg4patroni sidecar jar per
+# node, where BFM owns failover.
 #
 # Consumed VERBATIM by tools/live-env/live-env.sh: it copies this file to
 # _work-tmp/live-env/compose.yaml and runs
@@ -9,11 +9,29 @@
 # location (tools/live-env/) and the staged copy (_work-tmp/live-env/).
 # `reset` runs `down -v`, which removes the named disposable volumes below.
 #
-# Topology (fixed contract):
-#   live-pg1 (bfm-live-pg1, primary)  127.0.10.11:5432 (PG) + 127.0.10.11:7779 (agent)
-#   live-pg2 (bfm-live-pg2, replica)  127.0.10.12:5433 (PG) + 127.0.10.12:7779 (agent)
-# Inside containers PG listens on 5432 and the agent on 7779.
+# Pinned topology (fixed contract, Worker B parity — host reaches container
+# IPs directly on the bridge; NO `ports:` published):
+#   live-pg1 (bfm-live-pg1, primary)  172.30.51.11:5432 (PG) + 172.30.51.11:7779 (jar)
+#   live-pg2 (bfm-live-pg2, replica)  172.30.51.12:5432 (PG) + 172.30.51.12:7779 (jar)
+#   VIP                               172.30.51.100 (moved by the jar via
+#                                     `sudo ip address add/del` + `sudo /bin/true`;
+#                                     needs cap_add NET_ADMIN below)
+# Inside containers PG listens on 5432 and the jar on 7779 (same port, distinct
+# IPs — same shape as ADR-0002, new subnet). BFM stays on 127.0.0.1:9995.
 # PG creds are the fixed test-only superuser bfm/bfm (disposable only).
+#
+# configuration.json staging note: prepare stages per-node
+# _work-tmp/live-env/pg1|pg2/configuration.json (verbatim from
+# tools/live-env/configuration.json, node-identical values) and bind-mounts
+# each over the baked /opt/bfm/configuration.json (jar CWD-relative
+# ./configuration.json). The baked file keeps manual `docker build` working;
+# the mount wins at runtime so prepare-time values take effect without a
+# rebuild. Mount sources are relative to the STAGED compose file
+# (_work-tmp/live-env/compose.yaml); the source file here renders the same
+# paths for `docker compose config`.
+# vipInterface is eth0 (bridge default); the entrypoint logs the live
+# `ip address show` at boot — if a runtime ever shows another interface,
+# update configuration.json vipInterface and rebuild (do not assume).
 name: bfm-live
 
 services:
@@ -21,63 +39,77 @@ services:
     build:
       context: ../..
       dockerfile: tools/live-env/Dockerfile
-    image: bfm-live-pg:16
+    image: bfm-live-pg:14
     container_name: bfm-live-pg1
     hostname: live-pg1
+    cap_add:
+      - NET_ADMIN
     environment:
       POSTGRES_USER: bfm
       POSTGRES_PASSWORD: bfm
       NODE_ROLE: primary
-      PRIMARY_HOST: live-pg1
+      PRIMARY_HOST: 172.30.51.11
+      PRIMARY_PORT: 5432
       NODE_NAME: live-pg1
-      NODE_IP: 127.0.10.11
-      MINIPG_USER: bfm
-      MINIPG_PASSWORD: bfm
-    ports:
-      - "127.0.10.11:5432:5432"
-      - "127.0.10.11:7779:7779"
+      NODE_IP: 172.30.51.11
     # Passed to docker/entrypoint.sh, which feeds them to postgres via
-    # pg_ctl -o and saves them for agent-driven restarts. wal_log_hints=on
-    # is the pg_rewind prerequisite (issue #14). Synchronous replication is
-    # NOT preset: BFM sets it via setsync at runtime; initial async is fine.
+    # pg_ctl -o and saves them for jar-driven restarts. wal_log_hints=on
+    # is the pg_rewind prerequisite (issue #14); the jar's `bfm` mode also
+    # enforces wal_log_hints/hot_standby itself at startup — both agree.
+    # Synchronous replication is NOT preset: BFM sets it via setsync at
+    # runtime; initial async is fine.
     command: ["-c", "wal_level=replica", "-c", "wal_log_hints=on", "-c", "max_wal_senders=10", "-c", "max_replication_slots=10", "-c", "hot_standby=on", "-c", "listen_addresses=*"]
     volumes:
       - bfm-live-pg1-data:/var/lib/postgresql/data
+      - ./pg1/configuration.json:/opt/bfm/configuration.json:ro
+    networks:
+      bfm-live:
+        ipv4_address: 172.30.51.11
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U bfm"]
+      test: ["CMD-SHELL", "pg_isready -U bfm && curl -fsS -u bfm:bfm http://127.0.0.1:7779/minipg/status >/dev/null"]
       interval: 10s
       timeout: 5s
-      retries: 5
-      start_period: 30s
+      retries: 12
+      start_period: 60s
 
   live-pg2:
     build:
       context: ../..
       dockerfile: tools/live-env/Dockerfile
-    image: bfm-live-pg:16
+    image: bfm-live-pg:14
     container_name: bfm-live-pg2
     hostname: live-pg2
+    cap_add:
+      - NET_ADMIN
     environment:
       POSTGRES_USER: bfm
       POSTGRES_PASSWORD: bfm
       NODE_ROLE: replica
-      PRIMARY_HOST: live-pg1
+      PRIMARY_HOST: 172.30.51.11
+      PRIMARY_PORT: 5432
       NODE_NAME: live-pg2
-      NODE_IP: 127.0.10.12
-      MINIPG_USER: bfm
-      MINIPG_PASSWORD: bfm
-    ports:
-      - "127.0.10.12:5433:5432"
-      - "127.0.10.12:7779:7779"
+      NODE_IP: 172.30.51.12
     command: ["-c", "wal_level=replica", "-c", "wal_log_hints=on", "-c", "max_wal_senders=10", "-c", "max_replication_slots=10", "-c", "hot_standby=on", "-c", "listen_addresses=*"]
     volumes:
       - bfm-live-pg2-data:/var/lib/postgresql/data
+      - ./pg2/configuration.json:/opt/bfm/configuration.json:ro
+    networks:
+      bfm-live:
+        ipv4_address: 172.30.51.12
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U bfm"]
+      test: ["CMD-SHELL", "pg_isready -U bfm && curl -fsS -u bfm:bfm http://127.0.0.1:7779/minipg/status >/dev/null"]
       interval: 10s
       timeout: 5s
-      retries: 5
-      start_period: 30s
+      retries: 12
+      start_period: 60s
+
+# Pinned disposable bridge (exact subnet; static member IPs above).
+networks:
+  bfm-live:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.51.0/24
 
 # Named disposable volumes (exact names; `down -v` on reset removes them).
 volumes:
