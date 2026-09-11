@@ -87,3 +87,43 @@ fast-start:
 
 fast-validate:
     @bash "{{ fast_env_sh }}" validate
+
+# --- BFM live environment (v1: healthy + kill-primary, see tools/live-env/live-env.sh) ---
+# Primary loop is IDE-owned BFM: live-prepare -> live-start-dependencies ->
+# F5 "BFM — live environment" -> live-validate-dependencies.
+# live-start / live-validate are helper-owned-BFM wrappers.
+# live-kill-primary / live-rejoin drive the kill-primary scenario phases.
+live_env_sh := justfile_directory() + "/tools/live-env/live-env.sh"
+
+live-prepare scenario="healthy":
+    @bash "{{ live_env_sh }}" prepare "{{ scenario }}"
+
+live-start-dependencies:
+    @bash "{{ live_env_sh }}" start-dependencies
+
+live-validate-dependencies:
+    @bash "{{ live_env_sh }}" validate-dependencies
+
+live-status:
+    @bash "{{ live_env_sh }}" status
+
+live-logs n="100":
+    @bash "{{ live_env_sh }}" logs "{{ n }}"
+
+live-stop:
+    @bash "{{ live_env_sh }}" stop
+
+live-reset:
+    @bash "{{ live_env_sh }}" reset
+
+live-start:
+    @bash "{{ live_env_sh }}" start
+
+live-validate:
+    @bash "{{ live_env_sh }}" validate
+
+live-kill-primary:
+    @bash "{{ live_env_sh }}" kill-primary
+
+live-rejoin:
+    @bash "{{ live_env_sh }}" rejoin

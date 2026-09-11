@@ -1,0 +1,87 @@
+# bfm-live disposable stack (issue #18, part B): 2-node PostgreSQL
+# streaming-replication cluster with one compatible MiniPG agent per node,
+# where BFM owns failover.
+#
+# Consumed VERBATIM by tools/live-env/live-env.sh: it copies this file to
+# _work-tmp/live-env/compose.yaml and runs
+#   docker compose -f _work-tmp/live-env/compose.yaml -p bfm-live up -d --build
+# so `build.context: ../..` resolves to the repo root from BOTH this source
+# location (tools/live-env/) and the staged copy (_work-tmp/live-env/).
+# `reset` runs `down -v`, which removes the named disposable volumes below.
+#
+# Topology (fixed contract):
+#   live-pg1 (bfm-live-pg1, primary)  127.0.10.11:5432 (PG) + 127.0.10.11:7779 (agent)
+#   live-pg2 (bfm-live-pg2, replica)  127.0.10.12:5433 (PG) + 127.0.10.12:7779 (agent)
+# Inside containers PG listens on 5432 and the agent on 7779.
+# PG creds are the fixed test-only superuser bfm/bfm (disposable only).
+name: bfm-live
+
+services:
+  live-pg1:
+    build:
+      context: ../..
+      dockerfile: tools/live-env/Dockerfile
+    image: bfm-live-pg:16
+    container_name: bfm-live-pg1
+    hostname: live-pg1
+    environment:
+      POSTGRES_USER: bfm
+      POSTGRES_PASSWORD: bfm
+      NODE_ROLE: primary
+      PRIMARY_HOST: live-pg1
+      NODE_NAME: live-pg1
+      NODE_IP: 127.0.10.11
+      MINIPG_USER: bfm
+      MINIPG_PASSWORD: bfm
+    ports:
+      - "127.0.10.11:5432:5432"
+      - "127.0.10.11:7779:7779"
+    # Passed to docker/entrypoint.sh, which feeds them to postgres via
+    # pg_ctl -o and saves them for agent-driven restarts. wal_log_hints=on
+    # is the pg_rewind prerequisite (issue #14). Synchronous replication is
+    # NOT preset: BFM sets it via setsync at runtime; initial async is fine.
+    command: ["-c", "wal_level=replica", "-c", "wal_log_hints=on", "-c", "max_wal_senders=10", "-c", "max_replication_slots=10", "-c", "hot_standby=on", "-c", "listen_addresses=*"]
+    volumes:
+      - bfm-live-pg1-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bfm"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  live-pg2:
+    build:
+      context: ../..
+      dockerfile: tools/live-env/Dockerfile
+    image: bfm-live-pg:16
+    container_name: bfm-live-pg2
+    hostname: live-pg2
+    environment:
+      POSTGRES_USER: bfm
+      POSTGRES_PASSWORD: bfm
+      NODE_ROLE: replica
+      PRIMARY_HOST: live-pg1
+      NODE_NAME: live-pg2
+      NODE_IP: 127.0.10.12
+      MINIPG_USER: bfm
+      MINIPG_PASSWORD: bfm
+    ports:
+      - "127.0.10.12:5433:5432"
+      - "127.0.10.12:7779:7779"
+    command: ["-c", "wal_level=replica", "-c", "wal_log_hints=on", "-c", "max_wal_senders=10", "-c", "max_replication_slots=10", "-c", "hot_standby=on", "-c", "listen_addresses=*"]
+    volumes:
+      - bfm-live-pg2-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bfm"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+# Named disposable volumes (exact names; `down -v` on reset removes them).
+volumes:
+  bfm-live-pg1-data:
+    name: bfm-live-pg1-data
+  bfm-live-pg2-data:
+    name: bfm-live-pg2-data
