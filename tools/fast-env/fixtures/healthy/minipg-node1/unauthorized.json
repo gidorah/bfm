@@ -1,0 +1,18 @@
+{
+  "request": {
+    "method": "ANY",
+    "urlPattern": "/minipg/(pgstatus|status|checkvip|vip-down|cleanOldBackups|fixappname|clearAutoConf|updatepgpass|promote|rewind|rebaseUp|setsync|setasync|start|vip-up|checkpoint)",
+    "headers": {
+      "Authorization": {
+        "absent": true
+      }
+    }
+  },
+  "response": {
+    "status": 401,
+    "headers": {
+      "WWW-Authenticate": "Basic realm=\"minipg\""
+    },
+    "body": "Unauthorized: minipg credentials required"
+  }
+}

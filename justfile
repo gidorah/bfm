@@ -54,3 +54,76 @@ local-verify:
     @grep -Eq '^[[:space:]]*watcher\.cluster-port[[:space:]]*=[[:space:]]*9995([[:space:]]*$|[[:space:]])' "{{ config }}" || (echo "FAIL: watcher.cluster-port != 9995 in {{ config }}" >&2; exit 1); echo "OK watcher.cluster-port=9995"
     @python3 -c "import json,sys; d=json.load(open('{{ state }}')); assert isinstance(d.get('clusterServers'), list) and d['clusterServers'], 'clusterServers missing/empty'; print('OK state valid JSON with clusterServers: {{ state }}')" || (echo "FAIL: STATE not valid JSON with clusterServers: {{ state }}" >&2; exit 1)
     @git -C "{{ justfile_directory() }}" diff --quiet HEAD -- bfm_status.json || (echo "FAIL: repo-root ./bfm_status.json modified (local runs must not touch it)" >&2; exit 1); echo "OK repo-root bfm_status.json untouched"
+
+# --- BFM fast environment (v1: healthy + unreachable-primary, see tools/fast-env/fast-env.sh) ---
+# Primary loop is IDE-owned BFM: fast-prepare -> fast-start-dependencies ->
+# F5 "BFM — fast environment" -> fast-validate-dependencies.
+# fast-start / fast-validate are helper-owned-BFM wrappers (green in v1).
+fast_env_sh := justfile_directory() + "/tools/fast-env/fast-env.sh"
+
+fast-prepare scenario="healthy":
+    @bash "{{ fast_env_sh }}" prepare "{{ scenario }}"
+
+fast-start-dependencies:
+    @bash "{{ fast_env_sh }}" start-dependencies
+
+fast-validate-dependencies:
+    @bash "{{ fast_env_sh }}" validate-dependencies
+
+fast-status:
+    @bash "{{ fast_env_sh }}" status
+
+fast-logs n="100":
+    @bash "{{ fast_env_sh }}" logs "{{ n }}"
+
+fast-stop:
+    @bash "{{ fast_env_sh }}" stop
+
+fast-reset:
+    @bash "{{ fast_env_sh }}" reset
+
+fast-start:
+    @bash "{{ fast_env_sh }}" start
+
+fast-validate:
+    @bash "{{ fast_env_sh }}" validate
+
+# --- BFM live environment (v1: healthy + kill-primary, see tools/live-env/live-env.sh) ---
+# Primary loop is IDE-owned BFM: live-prepare -> live-start-dependencies ->
+# F5 "BFM — live environment" -> live-validate-dependencies.
+# live-start / live-validate are helper-owned-BFM wrappers.
+# live-kill-primary / live-rejoin drive the kill-primary scenario phases.
+live_env_sh := justfile_directory() + "/tools/live-env/live-env.sh"
+
+live-prepare scenario="healthy":
+    @bash "{{ live_env_sh }}" prepare "{{ scenario }}"
+
+live-start-dependencies:
+    @bash "{{ live_env_sh }}" start-dependencies
+
+live-validate-dependencies:
+    @bash "{{ live_env_sh }}" validate-dependencies
+
+live-status:
+    @bash "{{ live_env_sh }}" status
+
+live-logs n="100":
+    @bash "{{ live_env_sh }}" logs "{{ n }}"
+
+live-stop:
+    @bash "{{ live_env_sh }}" stop
+
+live-reset:
+    @bash "{{ live_env_sh }}" reset
+
+live-start:
+    @bash "{{ live_env_sh }}" start
+
+live-validate:
+    @bash "{{ live_env_sh }}" validate
+
+live-kill-primary:
+    @bash "{{ live_env_sh }}" kill-primary
+
+live-rejoin:
+    @bash "{{ live_env_sh }}" rejoin

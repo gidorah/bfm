@@ -13,6 +13,32 @@
             ],
             "args": [],
             "console": "internalConsole"
+        },
+        {
+            "type": "java",
+            "name": "BFM — fast environment",
+            "request": "launch",
+            "mainClass": "com.bisoft.bfm.BfmApplication",
+            "projectName": "bfm-app",
+            "cwd": "${workspaceFolder}/_work-tmp/fast-env/run",
+            "vmArgs": [
+                "-Dspring.config.location=file:${workspaceFolder}/_work-tmp/fast-env/application.properties"
+            ],
+            "args": [],
+            "console": "internalConsole"
+        },
+        {
+            "type": "java",
+            "name": "BFM — live environment",
+            "request": "launch",
+            "mainClass": "com.bisoft.bfm.BfmApplication",
+            "projectName": "bfm-app",
+            "cwd": "${workspaceFolder}/_work-tmp/live-env/run",
+            "vmArgs": [
+                "-Dspring.config.location=file:${workspaceFolder}/_work-tmp/live-env/application.properties"
+            ],
+            "args": [],
+            "console": "internalConsole"
         }
     ]
 }
