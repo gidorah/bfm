@@ -53,9 +53,9 @@ scenario-specific: no scenario logic lives in this image.
 service, so ``docker stop bfm-live-pg1`` kills both; BFM promotes pg2 via its
 agent and ``docker start`` brings pg1 back for BFM-driven rewind/rejoin.
 
-Stdlib only. ``python3 minipg-agent.py --self-check`` runs the offline
-self-check (route table + auth-challenge + translation + body parsing, no PG
-or sockets needed).
+Stdlib only. ``python3 minipg-agent.py --self-check`` runs the self-check
+(route table + auth-challenge + translation + body parsing + live keep-alive
+auth-framing regression on 127.0.0.1, no PG or docker needed).
 """
 
 import base64
@@ -70,6 +70,9 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # Stdlib only (no third-party dependencies).
@@ -134,6 +137,11 @@ POST_OPS = (
     "setasync",
     "updatepgpass",
 )
+
+# Bound for a buffered request body (Content-Length). Larger -> 413 + close.
+# 10 MiB is far above any BFM MiniPG body (small JSON / pgpass lines) while
+# still bounding memory per connection.
+MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024
 
 
 def log(msg):
@@ -876,13 +884,24 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def _read_body(self):
+        """Buffer the full POST body BEFORE the 401 challenge.
+
+        Apache HttpClient (BFM's MiniPG POST ops) sends the POST body
+        optimistically, then retries with credentials on the same keep-alive
+        connection. Answering 401 without consuming leaves those bytes on the
+        stream, so the next parse treats leftover body as a request line
+        (live E2E: `Bad request syntax ('{')` + `Unsupported method (...)`).
+        Returns "" for missing/zero/invalid length, None when over
+        MAX_REQUEST_BODY_BYTES (caller answers 413 + close).
+        """
         try:
             length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
+        except (ValueError, TypeError):
             length = 0
-        length = max(0, min(length, 65536))
-        if length == 0:
+        if length <= 0:
             return ""
+        if length > MAX_REQUEST_BODY_BYTES:
+            return None
         try:
             return self.rfile.read(length).decode("utf-8", "replace")
         except (ConnectionResetError, ValueError):
@@ -899,6 +918,32 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def _handle(self, method):
+        # Buffer/drain the request body BEFORE auth so a 401 keeps the
+        # keep-alive stream in sync (see _read_body). POST bodies are kept
+        # for dispatch; any body on other methods is drained and discarded
+        # for the same framing reason (GET ops dispatch with "").
+        raw = ""
+        if method == "POST":
+            buffered = self._read_body()
+            if buffered is None:
+                self.close_connection = True
+                self._send_text(413, "ERROR: request body too large", {"Connection": "close"})
+                return
+            raw = buffered
+        else:
+            try:
+                drain = int(self.headers.get("Content-Length") or 0)
+            except (ValueError, TypeError):
+                drain = 0
+            if drain > MAX_REQUEST_BODY_BYTES:
+                self.close_connection = True
+                self._send_text(413, "ERROR: request body too large", {"Connection": "close"})
+                return
+            if drain > 0:
+                try:
+                    self.rfile.read(drain)
+                except (ConnectionResetError, ValueError):
+                    pass
         path = self.path.split("?", 1)[0]
         if not path.startswith("/minipg/"):
             self._send_text(404, "not found")
@@ -909,7 +954,6 @@ class Handler(BaseHTTPRequestHandler):
         if op is None:
             self._send_text(404, "ERROR: unknown op")
             return
-        raw = self._read_body() if method == "POST" else ""
         try:
             body = dispatch(op, raw)
         except Exception as exc:  # never break BFM's loops
@@ -950,8 +994,9 @@ def serve():
 
 
 # --------------------------------------------------------------------------
-# Offline self-check: route table + auth-challenge + translation + parsing.
-# No PG, sockets, or docker needed: `python3 minipg-agent.py --self-check`.
+# Self-check: route table + auth-challenge + translation + parsing + live
+# keep-alive auth-framing regression (loopback sockets, no PG/docker needed).
+# `python3 minipg-agent.py --self-check`.
 # --------------------------------------------------------------------------
 
 def self_check():
@@ -1073,6 +1118,163 @@ def self_check():
         and "ctl-down" in down
         and "pg-down" in down,
     )
+
+    # 7. Keep-alive auth-framing regression (live socket, stdlib only).
+    # Apache HttpClient sends the POST body optimistically, then retries with
+    # creds on the SAME keep-alive connection. The agent must consume the
+    # body BEFORE answering 401, or the leftover bytes desync the stream
+    # (live E2E: 401 then `Bad request syntax ('{')` / `Unsupported method`).
+    # Uses a PG-independent op (/minipg/updatepgpass, only writes ~/.pgpass
+    # under an isolated HOME) so no PG is needed. Promote's exact Apache
+    # sequence is untestable without PG, so framing (two sequential POSTs,
+    # each with the right status) is asserted instead.
+    def _read_http_response(rfile):
+        status_line = rfile.readline().decode("iso-8859-1")
+        if not status_line:
+            raise RuntimeError("empty status line (server closed connection)")
+        parts = status_line.strip().split(None, 2)
+        if len(parts) < 2 or not parts[0].startswith("HTTP/"):
+            raise RuntimeError("bad status line: %r" % status_line)
+        code = int(parts[1])
+        headers = {}
+        while True:
+            line = rfile.readline().decode("iso-8859-1")
+            if line in ("", "\r\n", "\n"):
+                break
+            if ":" in line:
+                key, _, value = line.partition(":")
+                headers[key.strip().lower()] = value.strip()
+        try:
+            length = int(headers.get("content-length") or 0)
+        except ValueError:
+            length = 0
+        body = rfile.read(length) if length > 0 else b""
+        return code, headers, body
+
+    _framing_error = None
+    _first_code = _second_code = _oversize_code = None
+    _first_www = ""
+    _second_body = b""
+    _live_port = 18989
+    _server = None
+    _tmp_home = None
+    _old_home = os.environ.get("HOME")
+    try:
+        _tmp_home = tempfile.mkdtemp(prefix="minipg-selfcheck-")
+        os.environ["HOME"] = _tmp_home
+        try:
+            _server = ThreadingHTTPServer(("127.0.0.1", 18989), Handler)
+            _live_port = 18989
+        except OSError:
+            _server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            _live_port = _server.server_address[1]
+        _thread = threading.Thread(
+            target=_server.serve_forever, kwargs={"poll_interval": 0.05}
+        )
+        _thread.daemon = True
+        _thread.start()
+        time.sleep(0.3)
+        exp_user = os.environ.get("MINIPG_USER", "bfm")
+        exp_password = os.environ.get("MINIPG_PASSWORD", "bfm")
+        auth_value = "Basic %s" % base64.b64encode(
+            ("%s:%s" % (exp_user, exp_password)).encode()
+        ).decode()
+        # One keep-alive connection for both POSTs (the Apache retry shape).
+        _sock = socket.create_connection(("127.0.0.1", _live_port), timeout=5)
+        _sock.settimeout(5)
+        try:
+            _rfile = _sock.makefile("rb")
+            # (1) Unauthenticated POST with JSON body -> 401 + challenge.
+            _body1 = b'{"probe":"framing-1"}'
+            _req1 = (
+                "POST /minipg/updatepgpass HTTP/1.1\r\n"
+                "Host: 127.0.0.1:%d\r\n"
+                "Content-Type: text/plain\r\n"
+                "Content-Length: %d\r\n"
+                "Connection: keep-alive\r\n"
+                "\r\n" % (_live_port, len(_body1))
+            ).encode("iso-8859-1") + _body1
+            _sock.sendall(_req1)
+            _first_code, _first_headers, _ = _read_http_response(_rfile)
+            _first_www = _first_headers.get("www-authenticate", "")
+            # (2) Same connection, authenticated POST -> 200 with dispatch.
+            _body2 = b"127.0.10.99:5432:*:bfm:regression-proof"
+            _req2 = (
+                "POST /minipg/updatepgpass HTTP/1.1\r\n"
+                "Host: 127.0.0.1:%d\r\n"
+                "Content-Type: text/plain\r\n"
+                "Content-Length: %d\r\n"
+                "Connection: keep-alive\r\n"
+                "Authorization: %s\r\n"
+                "\r\n" % (_live_port, len(_body2), auth_value)
+            ).encode("iso-8859-1") + _body2
+            _sock.sendall(_req2)
+            _second_code, _, _second_body = _read_http_response(_rfile)
+            _rfile.close()
+        finally:
+            try:
+                _sock.close()
+            except OSError:
+                pass
+        # Oversize framing: fresh connection, huge Content-Length -> 413.
+        _osock = socket.create_connection(("127.0.0.1", _live_port), timeout=5)
+        _osock.settimeout(5)
+        try:
+            _orfile = _osock.makefile("rb")
+            _huge = MAX_REQUEST_BODY_BYTES + 1
+            _oreq = (
+                "POST /minipg/updatepgpass HTTP/1.1\r\n"
+                "Host: 127.0.0.1:%d\r\n"
+                "Content-Type: text/plain\r\n"
+                "Content-Length: %d\r\n"
+                "Connection: close\r\n"
+                "\r\n" % (_live_port, _huge)
+            ).encode("iso-8859-1")
+            _osock.sendall(_oreq)
+            _oversize_code, _, _ = _read_http_response(_orfile)
+            _orfile.close()
+        finally:
+            try:
+                _osock.close()
+            except OSError:
+                pass
+    except Exception as exc:
+        _framing_error = "%s: %s" % (type(exc).__name__, exc)
+    finally:
+        try:
+            if _server is not None:
+                _server.shutdown()
+                _server.server_close()
+        except Exception:
+            pass
+        try:
+            if _old_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = _old_home
+        except Exception:
+            pass
+        try:
+            if _tmp_home:
+                shutil.rmtree(_tmp_home, ignore_errors=True)
+        except Exception:
+            pass
+    if _framing_error is not None:
+        print("framing setup failed: %s" % _framing_error, flush=True)
+    check("framing/unauth-post-401", _first_code == 401)
+    check("framing/unauth-challenge", "basic" in (_first_www or "").lower())
+    check("framing/keepalive-second-post-200", _second_code == 200)
+    check(
+        "framing/second-body-dispatch-ok",
+        _second_code == 200
+        and _second_body.decode("utf-8", "replace").startswith("OK")
+        and "entries" in _second_body.decode("utf-8", "replace"),
+    )
+    check(
+        "framing/sequential-framing-ok",
+        _first_code == 401 and _second_code == 200,
+    )
+    check("framing/oversize-413", _oversize_code == 413)
 
     print(
         "self-check: %s" % ("ALL PASS" if not failures else "%d FAILURES: %s" % (len(failures), failures)),
