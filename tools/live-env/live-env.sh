@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# BFM live environment helper (issue #18, part A: lifecycle).
+# BFM live environment helper (issue #18 lifecycle; issue #23 real-jar rewire).
 #
 # Primary loop (IDE-owned BFM):
 #   live-env.sh prepare healthy -> live-env.sh start-dependencies
@@ -9,43 +9,65 @@
 # Failover drivers: kill-primary (docker stop bfm-live-pg1), rejoin (docker start).
 # Inspect/teardown: status, logs [N], stop, reset.
 #
-# Fixed topology (issue #18 contract, same tuples as the fast env):
+# Fixed topology (issue #23 contract, ADR-0005; pinned - must match Worker A):
 #   BFM                127.0.0.1:9995   (watcher.cluster-port, server.address)
 #   BFM4Patroni        127.0.0.1:9994   (reserved by the dev port split; live env must never bind it)
-#   PG node 1          127.0.10.11:5432 (live-pg1 / bfm-live-pg1, primary)
-#   PG node 2          127.0.10.12:5433 (live-pg2 / bfm-live-pg2, replica)
-#   MiniPG per node    127.0.10.11:7779 + 127.0.10.12:7779 (real agents, same port)
+#   Bridge subnet      172.30.51.0/24   (one fixed bridge, static member IPs,
+#                                       no published ports; the host kernel
+#                                       routes the bridge, so the host dials
+#                                       container IPs directly)
+#   PG node 1          172.30.51.11:5432 (live-pg1 / bfm-live-pg1, primary)
+#   PG node 2          172.30.51.12:5432 (live-pg2 / bfm-live-pg2, replica;
+#                                       same port - distinct IPs)
+#   MiniPG per node    172.30.51.11:7779 + 172.30.51.12:7779 (real minipg4patroni
+#                                       jar sidecar, same port)
+#   VIP                172.30.51.100     (spare bridge IP; the jar moves it via
+#                                       real `ip` ops on failover)
 #   Peer BFM           no-pair
 #
 # Fixed disposable test-only creds bfm/bfm everywhere (server.pguser/pgpassword,
-# minipg.username/password, live PG bfm/bfm). Loopback-only, never production.
+# minipg.username/password, live PG bfm/bfm). Pinned bridge subnet only, never
+# production.
 #
 # Layout (all generated, git-ignored, disposable):
 #   _work-tmp/live-env/application.properties   spring.config.location target
 #   _work-tmp/live-env/run/bfm_status.json      BFM CWD + state (PrintWriter-truncated: readers retry)
 #   _work-tmp/live-env/logs/                    pre-storage-redacted helper/BFM logs
 #   _work-tmp/live-env/compose.yaml             verbatim stage of tools/live-env/compose.yaml
+#   _work-tmp/live-env/minipg.jar               real minipg4patroni jar for the
+#                                               member image build (Worker A
+#                                               Dockerfile COPYs this)
+#   _work-tmp/live-env/pg1/configuration.json  per-node jar configs, bind-mounted
+#   _work-tmp/live-env/pg2/configuration.json  per service as the jar's
+#                                               CWD-relative ./configuration.json
 #   _work-tmp/live-env/fixtures/<scenario>/     verbatim stage of tools/live-env/fixtures/<scenario>/ (seed.json)
 #   _work-tmp/live-env/.(launch-id|owner|scenario|helper-bfm.pid)
 #   _work-tmp/live-env/.ide-bfm-active          IDE-owned BFM marker (F5 flow creates it;
 #                                               this helper only respects it, never creates it)
 #
-# Docker interface (worker B provides tools/live-env/compose.yaml with services
-# live-pg1/live-pg2 and containers bfm-live-pg1/bfm-live-pg2; compose project
-# name bfm-live via the -p flag). This script only ever calls:
+# Docker interface (Worker A owns tools/live-env/compose.yaml with services
+# live-pg1/live-pg2 and containers bfm-live-pg1/bfm-live-pg2, plus the member
+# Dockerfile/entrypoint/configuration.json template; compose project name
+# bfm-live via the -p flag). This script only ever calls:
 #   docker compose -f "$LIVE_DIR/compose.yaml" -p bfm-live ...
+# plus read-only `docker exec <container> ip address show` for VIP proof and
+# `docker stop/start bfm-live-pg1` for the kill-primary drivers.
 # Volumes are docker named volumes prefixed bfm-live- (reset = `down -v`).
-# `prepare` is docker-independent (renders config, stages compose, writes
-# launch-id/owner/scenario, deletes stale STATE) and must NOT require a daemon.
+# `prepare` renders config, stages compose + fixtures + jar + per-node jar
+# configs, and writes launch-id/owner/scenario (deletes stale STATE). It stays
+# docker-independent (never touches the daemon) EXCEPT the jar build, which
+# needs maven + the sibling ../minipgonpatroni checkout (or BFM_LIVE_MINIPG_JAR=
+# to skip it) - and fails clearly without them.
 #
 # validate-dependencies semantics (bounded polling everywhere, no blind sleeps):
-# config identity + PG TCP + MiniPG HTTP + live SQL (host psql probes:
-# pg_is_in_recovery roles per scenario, pg_stat_replication non-empty on the
-# master, wal_log_hints=on) AND BFM evidence is mandatory (no deps-only green):
-# the IDE/helper-owned BFM must listen on 127.0.0.1:9995 with /proc-proven
-# config/CWD identity, staged-seed identity (scenario+pglist from
-# fixtures/<scenario>/seed.json), fresh launch-id-anchored logs,
-# per-scenario state, and real active/no-pair discovery. Per scenario:
+# config identity + PG TCP + MiniPG jar responses + live SQL (host psql probes
+# to the bridge IPs: pg_is_in_recovery roles per scenario, pg_stat_replication
+# non-empty on the master, wal_log_hints=on) AND BFM evidence is mandatory (no
+# deps-only green): the IDE/helper-owned BFM must listen on 127.0.0.1:9995
+# with /proc-proven config/CWD identity, staged-seed identity (scenario+pglist
+# from fixtures/<scenario>/seed.json), staged per-node jar-config identity
+# (ADR-0005 contract pins), fresh launch-id-anchored logs, per-scenario state,
+# and real active/no-pair discovery. Per scenario:
 #   healthy = both PG UP, pg1 primary (recovery=f) + pg2 replica (recovery=t),
 #   replication flowing on pg1, wal_log_hints=on both, HEALTHY pg1 MASTER +
 #   pg2 SLAVE state (exact pin per staged seed; set-wise would contradict the
@@ -54,29 +76,46 @@
 #     pre-kill  = pg1 UP + pg1 primary: healthy-like assertions (same exact pin).
 #     DOWN      = pg1 TCP DOWN: fresh state shows pg2 MASTER (pg1 never
 #       MASTER/SLAVE), BFM log INACCESSIBLE observation + promote/Failover
-#       attempt evidence, VIP holder on pg2 via agent /minipg/checkvip.
-#     rejoined  = pg1 UP + pg1 replica: pg2 MASTER + pg1 SLAVE + VIP pg2.
+#       attempt evidence, VIP 172.30.51.100 held by exactly one member
+#       (read-only docker exec inspection - never the jar's self-healing VIP
+#       route) whose holder is the pg2 MASTER, plus a master proof write.
+#     rejoined  = pg1 UP + pg1 replica: pg2 MASTER + pg1 SLAVE + VIP on the
+#       pg2 MASTER + proof write visible on the pg1 replica.
 #
-# Safety (fast-env parity, live-concrete): explicit 127.0.0.1 bind, tuple-aware
-# occupancy incl. wildcard listeners, proxy bypass on every probe, pre-storage
-# log redaction (fail-closed), canonical-path + symlink refusal, PID/group
-# ownership enforcement (OWNER pgid SET checked on stop/reset, never just
-# stored), reset refusal while IDE-owned BFM is active, refusal of external
-# spring/JVM/MAVEN overrides and of the BFM deployment path
-# (/etc/bfm/bfmwatcher/application.properties). Never touches repo-root
-# bfm_status.json, _work-tmp/local/, or _work-tmp/fast-env/.
+# Safety (fast-env parity, live-concrete): explicit 127.0.0.1 BFM bind,
+# tuple-aware occupancy incl. wildcard listeners, proxy bypass on every probe,
+# pre-storage log redaction (fail-closed), canonical-path + symlink refusal,
+# PID/group ownership enforcement (OWNER pgid SET checked on stop/reset, never
+# just stored), reset refusal while IDE-owned BFM is active, refusal of
+# external spring/JVM/MAVEN overrides and of the BFM deployment path
+# (/etc/bfm/bfmwatcher/application.properties). Loopback-only guards carry one
+# documented carve-out: the pinned disposable bridge subnet 172.30.51.0/24
+# (ADR-0005; Worker C owns the ADR text, this script carries grep anchors).
+# Every other non-loopback pglist is refused fail-closed. Never touches
+# repo-root bfm_status.json, _work-tmp/local/, or _work-tmp/fast-env/.
 set -euo pipefail
 
-# --- fixed topology ------------------------------------------------------------
+# --- fixed topology (issue #23 contract, ADR-0005) -------------------------------
+# Pinned disposable bridge subnet 172.30.51.0/24: BFM itself stays
+# loopback-only (127.0.0.1:9995) while PG/MiniPG tuples live on the bridge
+# (the host kernel routes the bridge; no published ports; the host dials
+# container IPs directly). This bridge is the ONLY non-loopback carve-out in
+# the guards below - every other non-loopback pglist is refused fail-closed.
+# ADR-0005 records the topology change (Worker C owns the ADR text; the
+# ADR-0005 markers in this script are its grep anchors). Both PG nodes share
+# port 5432 - the tuples stay distinct via the static IPs.
 BFM_IP="127.0.0.1"
 BFM_PORT="9995"
-PG1_IP="127.0.10.11"; PG1_PORT="5432"
-PG2_IP="127.0.10.12"; PG2_PORT="5433"
+BRIDGE_SUBNET="172.30.51.0/24"
+PG1_IP="172.30.51.11"; PG1_PORT="5432"
+PG2_IP="172.30.51.12"; PG2_PORT="5432"
+VIP_IP="172.30.51.100"
 MINIPG_PORT="7779"
 # addr:port tuples owned by this environment (never bare ports)
 PG_TUPLES="$PG1_IP:$PG1_PORT $PG2_IP:$PG2_PORT"
 MINIPG_TUPLES="$PG1_IP:$MINIPG_PORT $PG2_IP:$MINIPG_PORT"
 BFM_TUPLE="$BFM_IP:$BFM_PORT"
+WANT_PGLIST="$PG1_IP:$PG1_PORT,$PG2_IP:$PG2_PORT"
 
 # Docker interface (worker B owns tools/live-env/compose.yaml).
 COMPOSE_PROJECT="bfm-live"
@@ -109,6 +148,25 @@ FIXTURES_SOURCE_BASE="$TOOLS_DIR/fixtures"
 FIXTURES_STAGED_BASE="$LIVE_DIR/fixtures"
 SEED_NAME="seed.json"
 
+# Real-jar staging (issue #23, ADR-0005): prepare builds (or accepts via
+# override) the minipg4patroni jar and stages it plus per-node
+# configuration.json files for Worker A's compose build/entrypoint:
+#   _work-tmp/live-env/minipg.jar                jar for the member image COPY
+#   _work-tmp/live-env/pg1|pg2/configuration.json  one per service, bind-mounted
+#                                               as the jar's CWD-relative
+#                                               ./configuration.json (identical
+#                                               content today - the jar carries
+#                                               no node id; the PG role comes
+#                                               from entrypoint env).
+MINIPG_ROOT="$(cd "$REPO_ROOT/../minipgonpatroni" 2>/dev/null && pwd || true)"
+MINIPG_JAR_VERSIONED="minipg4patroni-app-1.2.3.jar"
+MINIPG_STAGED_JAR="$LIVE_DIR/minipg.jar"
+MINIPG_STAGED_CONF_PG1="$LIVE_DIR/pg1/configuration.json"
+MINIPG_STAGED_CONF_PG2="$LIVE_DIR/pg2/configuration.json"
+# Worker A's configuration.json template candidates (first hit wins; a pinned
+# inline fallback is generated while none has landed yet).
+MINIPG_TEMPLATE_CANDIDATES="$TOOLS_DIR/configuration.json $TOOLS_DIR/docker/configuration.json"
+
 VALIDATE_TIMEOUT_PG=15
 VALIDATE_TIMEOUT_MINIPG=15
 VALIDATE_TIMEOUT_SQL=120
@@ -128,10 +186,10 @@ note() { printf '%s\n' "$*"; }
 
 # Pre-storage redaction: strip passwords / Basic creds before anything hits disk.
 # Same convention as fast-env: the fixed public test-only value "bfm"
-# (loopback-only live env) is NOT redacted as a literal (it would mangle every
-# innocent mention); its secret-bearing form, the Basic blob YmZtOmJmbQ==
-# (bfm:bfm), is covered by a static rule below. Any other configured secret is
-# still redacted via redact_refresh.
+# (disposable bridge-subnet live env) is NOT redacted as a literal (it would
+# mangle every innocent mention); its secret-bearing form, the Basic blob
+# YmZtOmJmbQ== (bfm:bfm), is covered by a static rule below. Any other
+# configured secret is still redacted via redact_refresh.
 # PROCsub SAFETY: redact()'s body MUST stay a single simple command (see
 # tools/fast-env/fast-env.sh for why a compound body hangs bash here).
 REDACT_STATIC=(
@@ -419,6 +477,23 @@ pg_exec() {
     | tail -n 1 | tr -d '[:space:]'
 }
 
+# pg_write <ip> <port> <sql>: true iff the SQL executes OK (output ignored).
+# Same creds/channel as pg_exec. Statements run under a bounded
+# statement_timeout so a synchronous-commit stall against a dead standby fails
+# the probe instead of hanging validation (callers poll boundedly anyway).
+pg_write() {
+  local ip="$1" port="$2"; shift 2
+  local pguser pgpass
+  pguser="$(config_val 'server\.pguser')"
+  pgpass="$(config_val 'server\.pgpassword')"
+  [ -n "$pguser" ] && [ -n "$pgpass" ] \
+    || { err "cannot run live SQL: server.pguser/pgpassword missing in $CONFIG"; return 1; }
+  command -v psql >/dev/null 2>&1 \
+    || { err "psql client is missing (live-env prerequisite for live SQL probes; install postgresql-client)"; return 1; }
+  PGPASSWORD="$pgpass" psql -h "$ip" -p "$port" -U "$pguser" -d postgres \
+    -v ON_ERROR_STOP=1 -tAc "SET statement_timeout = '15s'; $*" >/dev/null 2>&1
+}
+
 # sql_is <ip> <port> <sql> <want>: true iff live SQL returns exactly <want>.
 sql_is() {
   [ "$(pg_exec "$1" "$2" "$3" || true)" = "$4" ]
@@ -448,17 +523,100 @@ minipg_body() {
     curl --noproxy '*' --max-time 5 -s -u "$muser:$mpass" "http://$ip:$MINIPG_PORT$route" 2>/dev/null || true
 }
 
-# vip_on <ip>: true iff that node's agent /minipg/checkvip names <ip> as holder.
-# Contract: the agent answers the holder address in the body (worker B aligns
-# the images to this); BFM's own vipUp/vipDown flow moves it on failover.
-vip_on() {
+# minipg_pgstatus_ok <ip>: true iff the REAL jar answers HTTP 200 on
+# /minipg/pgstatus with a pg_ctl-status body (minipg creds, proxy-bypassed).
+# The jar shells out to `pg_ctl status -D...` and serializes the output lines
+# as a JSON list (MiniPGController.pgstatus), so a genuine body always names
+# pg_ctl - running ("pg_ctl: server is running...") or stopped ("pg_ctl: no
+# server running..."). That literal is the jar fingerprint: never assert
+# agent-internal strings here (the Python agent is deleted, ADR-0005).
+minipg_pgstatus_ok() {
   local ip="$1" body
-  body="$(minipg_body "$ip" "/minipg/checkvip" || true)"
-  [ -n "$body" ] && printf '%s' "$body" | grep -qF "$ip"
+  body="$(minipg_body "$ip" "/minipg/pgstatus" || true)"
+  [ -n "$body" ] || return 1
+  printf '%s' "$body" | grep -q "pg_ctl" || return 1
+  return 0
+}
+
+# --- VIP proof (issue #23, ADR-0005; read-only, never the jar's self-healing
+# VIP route) -------------------------------------------------------------------
+# The jar's VIP-check route lists interfaces and, when the VIP is absent,
+# performs the VIP move itself before answering success. Calling it therefore
+# manufactures the very state it inspects, so validate must NEVER use it as
+# VIP evidence (no call site in this script may reference that route). Proof
+# is read-only instead:
+#   (a) `docker exec <container> ip address show` on both nodes: exactly one
+#       holder of VIP_IP;
+#   (b) holder == current SQL MASTER (pg_is_in_recovery()=f on the holder);
+#   (c) a replicated write on the master is visible on the replica (DOWN
+#       phase has no replica: the master write alone is the read-write proof;
+#       rejoined phase additionally requires replica visibility, on top of the
+#       pg_stat_replication flow (d) already asserts).
+# vip_holder_container: print the single member container holding VIP_IP.
+# Fail-closed on zero/two holders. A stopped container (DOWN-phase pg1) holds
+# no addresses and is skipped via inspect - a stopped netns cannot hold an IP.
+vip_holder_container() {
+  local c holders="" out running
+  for c in "$PG1_CONTAINER" "$PG2_CONTAINER"; do
+    running="$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null || true)"
+    if [ "$running" != "true" ]; then
+      continue
+    fi
+    out="$(docker exec "$c" ip address show 2>/dev/null || true)"
+    [ -n "$out" ] \
+      || { err "cannot inspect addresses in running container $c (docker exec ip address show failed)"; return 1; }
+    if printf '%s' "$out" | grep -qwF "$VIP_IP"; then
+      holders="$holders $c"
+    fi
+  done
+  case "$holders" in
+    " $PG1_CONTAINER"|" $PG2_CONTAINER")
+      printf '%s' "$holders" | tr -d ' '
+      return 0;;
+    "")
+      err "VIP $VIP_IP held by no member container (want exactly one holder)"
+      return 1;;
+    *)
+      err "VIP $VIP_IP held by multiple member containers:$holders (want exactly one holder)"
+      return 1;;
+  esac
+}
+
+# holder_pg_tuple <container>: print the holder's "ip:port" PG tuple.
+holder_pg_tuple() {
+  case "$1" in
+    "$PG1_CONTAINER") printf '%s:%s' "$PG1_IP" "$PG1_PORT";;
+    "$PG2_CONTAINER") printf '%s:%s' "$PG2_IP" "$PG2_PORT";;
+    *) err "unknown member container '$1' (want $PG1_CONTAINER/$PG2_CONTAINER)"; return 1;;
+  esac
+}
+
+# vip_write_proof <master_ip> <master_port> <replica_ip|-> <replica_port|-> <tag>:
+# (c) replicated-write proof. Creates a disposable proof table on the master,
+# commits the launch-anchored tag there, and - when a replica is up - polls
+# until the row is visible on it. Retry-safe (idempotent DDL + ON CONFLICT).
+vip_write_proof() {
+  local mip="$1" mport="$2" rip="$3" rport="$4" tag="$5"
+  poll_until "$VALIDATE_TIMEOUT_SQL" pg_write "$mip" "$mport" \
+    "CREATE TABLE IF NOT EXISTS bfm_live_vip_proof (tag text PRIMARY KEY, seen timestamptz DEFAULT now());" \
+    || { err "live SQL: cannot create proof table on master $mip:$mport after ${VALIDATE_TIMEOUT_SQL}s"; return 1; }
+  poll_until "$VALIDATE_TIMEOUT_SQL" pg_write "$mip" "$mport" \
+    "INSERT INTO bfm_live_vip_proof (tag) VALUES ('$tag') ON CONFLICT (tag) DO NOTHING;" \
+    || { err "live SQL: master $mip:$mport rejected the proof write after ${VALIDATE_TIMEOUT_SQL}s (not read-write?)"; return 1; }
+  note "live SQL: proof write '$tag' committed on master $mip:$mport"
+  if [ "$rip" != "-" ]; then
+    poll_until "$VALIDATE_TIMEOUT_SQL" sql_is "$rip" "$rport" \
+      "SELECT count(*) FROM bfm_live_vip_proof WHERE tag = '$tag';" "1" \
+      || { err "live SQL: proof row '$tag' not visible on replica $rip:$rport after ${VALIDATE_TIMEOUT_SQL}s (replication not flowing?)"; return 1; }
+    note "live SQL: proof row visible on replica $rip:$rport (replicated write proven)"
+  else
+    note "live SQL: no replica up (DOWN phase); master write alone is the read-write proof"
+  fi
+  return 0
 }
 
 # Render CONFIG from the dev/live-env template (or the inline fallback).
-# Credentials are fixed test-only bfm/bfm (loopback-only); no substitution.
+# Credentials are fixed test-only bfm/bfm (disposable bridge subnet); no substitution.
 render_config() { # render_config <launch> <scenario>
   local launch_id="$1" scenario="$2"
   local template="$REPO_ROOT/dev/live-env/application.properties"
@@ -478,7 +636,7 @@ watcher.cluster-port            = 9995
 watcher.cluster-pair            = no-pair
 app.timeout-ignorance-count     = 3
 bfm.watch-strategy              = availability
-server.pglist                   = 127.0.10.11:5432,127.0.10.12:5433
+server.pglist                   = 172.30.51.11:5432,172.30.51.12:5432
 bfm.user-crypted                = false
 bfm.use-tls                     = false
 minipg.use-tls                  = false
@@ -523,6 +681,115 @@ EOF
   chmod 600 "$CONFIG"
 }
 
+# stage_minipg_jar: provide the real minipg4patroni jar for Worker A's member
+# image build (issue #23, ADR-0005). BFM_LIVE_MINIPG_JAR= skips the build and
+# must point at an existing jar (fast iteration). Otherwise the sibling
+# checkout ../minipgonpatroni is REQUIRED and the jar is rebuilt via
+# ./mvnw -f $MINIPG_ROOT/pom.xml -pl app -am package (reference parity with
+# bfm4patroni-vaadin tools/full-local-test; -DskipTests keeps prepare a
+# staging step, not a test run). Prepare stays docker-independent: only maven
+# + the sibling checkout are needed, never the daemon. Fail-closed everywhere.
+stage_minipg_jar() {
+  local src="${BFM_LIVE_MINIPG_JAR:-}"
+  if [ -n "$src" ]; then
+    [ -f "$src" ] \
+      || { err "BFM_LIVE_MINIPG_JAR='$src' does not exist (override must point at an existing minipg4patroni jar)"; return 1; }
+    note "minipg jar: OVERRIDE $src (build skipped)"
+  else
+    [ -n "$MINIPG_ROOT" ] && [ -f "$MINIPG_ROOT/pom.xml" ] \
+      || { err "sibling ../minipgonpatroni checkout is required (absent: $REPO_ROOT/../minipgonpatroni/pom.xml); or set BFM_LIVE_MINIPG_JAR=/path/to/minipg4patroni-app-*.jar to skip the build"; return 1; }
+    local mvnw="$REPO_ROOT/mvnw"
+    [ -x "$mvnw" ] \
+      || { err "maven wrapper $mvnw missing/not executable (needed to build the minipg jar; or set BFM_LIVE_MINIPG_JAR=... to skip it)"; return 1; }
+    note "minipg jar: BUILD from $MINIPG_ROOT (\$MINIPG_ROOT/pom.xml -pl app -am package -DskipTests)"
+    mkdir -p "$LOGS"
+    if ! "$mvnw" --no-transfer-progress -f "$MINIPG_ROOT/pom.xml" -pl app -am package -DskipTests 2>&1 | redact >>"$HELPER_LOG" 2>/dev/null; then
+      err "minipg jar build failed (see redacted $HELPER_LOG)"
+      return 1
+    fi
+    src="$MINIPG_ROOT/app/target/$MINIPG_JAR_VERSIONED"
+    if [ ! -f "$src" ]; then
+      src="$(ls "$MINIPG_ROOT"/app/target/minipg4patroni-app-*.jar 2>/dev/null | head -n 1 || true)"
+    fi
+    [ -n "$src" ] && [ -f "$src" ] \
+      || { err "minipg jar was not produced under $MINIPG_ROOT/app/target/ (want $MINIPG_JAR_VERSIONED)"; return 1; }
+    note "minipg jar: BUILT $src"
+  fi
+  cp "$src" "$MINIPG_STAGED_JAR"
+  chmod 644 "$MINIPG_STAGED_JAR" 2>/dev/null || true
+  note "minipg jar: STAGED $src -> $MINIPG_STAGED_JAR (Worker A member image COPYs this)"
+}
+
+# render_minipg_config_inline <dest>: pinned per-node configuration.json for
+# the real jar (ADR-0005 mandatory values). Fallback only: Worker A's template
+# (see MINIPG_TEMPLATE_CANDIDATES) is authoritative when present. Both nodes
+# share this content today (the jar carries no node id; the PG role comes from
+# entrypoint env), staged as two files so compose can bind-mount per service.
+render_minipg_config_inline() {
+  local dest="$1"
+  cat >"$dest" <<EOF
+{
+  "username": "bfm",
+  "password": "bfm",
+  "isEncrypted": false,
+  "pgConfFilePath": "/var/lib/postgresql/data/postgresql.conf",
+  "pgPassFilePath": "/var/lib/postgresql/.pgpass",
+  "postgresBinPath": "/usr/lib/postgresql/14/bin/",
+  "pgCtlBinPath": "/usr/lib/postgresql/14/bin/",
+  "postgresDataPath": "/var/lib/postgresql/data/",
+  "pgVersion": "V14X",
+  "restoreCommand": "/bin/true",
+  "replicationUser": "bfm",
+  "vipInterface": "eth0",
+  "vipIp": "$VIP_IP",
+  "vipIpNetmask": "24",
+  "sslMode": "disable",
+  "sslCompression": "0",
+  "postVipUp": "/bin/true",
+  "os": "linux",
+  "clusterManager": "bfm",
+  "port": $MINIPG_PORT,
+  "tlsKeyAlias": "bfm",
+  "useSsl": false,
+  "tlsSecret": "",
+  "tlsKeyStoreType": "PKCS12",
+  "tlsKeyStore": ""
+}
+EOF
+  # 644 (not 600): bind-mounted into the container and read by the postgres
+  # user inside (host uid != container postgres uid); test-only bfm/bfm
+  # creds, same as the baked image copy.
+  chmod 644 "$dest" 2>/dev/null || true
+}
+
+# stage_minipg_configs: per-node configuration.json into pg1//pg2/ for
+# Worker A's per-service bind-mounts (jar CWD-relative ./configuration.json).
+# Fail-closed on unsubstituted @@tokens@@ (template/contract drift).
+stage_minipg_configs() {
+  mkdir -p "$LIVE_DIR/pg1" "$LIVE_DIR/pg2"
+  local tmpl="" cand
+  for cand in $MINIPG_TEMPLATE_CANDIDATES; do
+    if [ -f "$cand" ]; then tmpl="$cand"; break; fi
+  done
+  if [ -n "$tmpl" ]; then
+    cp "$tmpl" "$MINIPG_STAGED_CONF_PG1"
+    cp "$tmpl" "$MINIPG_STAGED_CONF_PG2"
+    note "minipg config: STAGED $tmpl -> $MINIPG_STAGED_CONF_PG1 + $MINIPG_STAGED_CONF_PG2 (Worker A template, verbatim per node)"
+  else
+    note "minipg config: WARN Worker A template absent (checked: $MINIPG_TEMPLATE_CANDIDATES); generating inline pinned per-node configuration.json (ADR-0005 values)"
+    render_minipg_config_inline "$MINIPG_STAGED_CONF_PG1"
+    render_minipg_config_inline "$MINIPG_STAGED_CONF_PG2"
+  fi
+  # 644 (not 600): bind-mounted into the container and read by the postgres
+  # user inside (host uid != container postgres uid); test-only bfm/bfm
+  # creds, same as the baked image copy.
+  chmod 644 "$MINIPG_STAGED_CONF_PG1" "$MINIPG_STAGED_CONF_PG2" 2>/dev/null || true
+  if grep -q "@@" "$MINIPG_STAGED_CONF_PG1" "$MINIPG_STAGED_CONF_PG2" 2>/dev/null; then
+    err "staged minipg config contains unsubstituted @@tokens@@ (template/contract drift)"
+    return 1
+  fi
+}
+
 # launch_bg_redacted <logfile> <cmd...>: background cmd with stdout/stderr
 # piped through pre-storage redaction; echoes the CHILD pid (process
 # substitution keeps $! as the real child, unlike a plain pipeline).
@@ -552,8 +819,10 @@ current_scenario() {
 }
 
 # --- prepare ---------------------------------------------------------------------
-# Docker-independent: renders config, stages compose, writes
-# launch-id/owner/scenario, deletes stale STATE. Never touches the daemon.
+# Renders config, stages compose + fixtures + minipg jar + per-node jar
+# configs, writes launch-id/owner/scenario, deletes stale STATE. Stays
+# docker-independent (never touches the daemon); only the jar build may need
+# maven + the sibling checkout (or BFM_LIVE_MINIPG_JAR= to skip it).
 cmd_prepare() {
   local scenario="${1:-healthy}"
   refuse_overrides || return 1
@@ -621,6 +890,11 @@ cmd_prepare() {
   fi
   [ -s "$fixtures_dst/$SEED_NAME" ] \
     || { err "staged seed $fixtures_dst/$SEED_NAME missing/empty (fail-closed; re-run '$0 prepare $scenario')"; return 1; }
+  # Stage the real minipg jar + per-node jar configs for Worker A's compose
+  # build/entrypoint (issue #23; prepare stays docker-independent - only maven
+  # + the sibling checkout may be needed, never the daemon).
+  stage_minipg_jar || return 1
+  stage_minipg_configs || return 1
   # Stale disposable state from a previous run must not poison validation.
   # The dev/live-env seed is reference-only; BFM rewrites STATE on its loop.
   rm -f "$STATE"
@@ -646,16 +920,18 @@ pids_alive() { # pids_alive <file>: true if any listed PID is alive
 # --- start-dependencies ----------------------------------------------------------
 # Docker owns adopt-vs-launch (compose up is idempotent); only the BFM tuple
 # still needs an occupancy guard (see `start`). Brings up live-pg1/live-pg2
-# (PG + per-node MiniPG agents; healthy seeding happens in the containers),
-# then bounded-waits PG TCP tuples + MiniPG HTTP /minipg/pgstatus with minipg
-# creds. For kill-primary this yields the pre-kill state; `kill-primary`
-# drives the DOWN phase from here.
+# (PG + per-node real-jar MiniPG sidecars; healthy seeding happens in the
+# containers), then bounded-waits PG TCP tuples + jar /minipg/pgstatus bodies
+# with minipg creds. For kill-primary this yields the pre-kill state;
+# `kill-primary` drives the DOWN phase from here.
 cmd_start_dependencies() {
   refuse_overrides || return 1
   guard_paths || return 1
   [ -f "$CONFIG" ] || { err "not prepared (run '$0 prepare [healthy|kill-primary]' first)"; return 1; }
   redact_refresh
   require_compose || return 1
+  [ -s "$MINIPG_STAGED_JAR" ] \
+    || { err "staged minipg jar $MINIPG_STAGED_JAR missing/empty (run '$0 prepare [healthy|kill-primary]' first; Worker A member image COPYs this)"; return 1; }
   mkdir -p "$LOGS"
 
   local scenario
@@ -667,8 +943,7 @@ cmd_start_dependencies() {
   fi
   log "start-dependencies compose up -d --build ok"
 
-  local t ip port muser mpass
-  muser="$(config_val 'minipg\.username')"; mpass="$(config_val 'minipg\.password')"
+  local t ip port
   for t in $PG_TUPLES; do
     ip="${t%%:*}"; port="${t##*:}"
     if poll_until "$START_TIMEOUT_PG" tcp_probe "$ip" "$port"; then
@@ -679,11 +954,11 @@ cmd_start_dependencies() {
     fi
   done
   for t in $MINIPG_TUPLES; do
-    ip="${t%%:*}"; port="${t##*:}"
-    if poll_until "$START_TIMEOUT_MINIPG" http_200 "http://$ip:$port/minipg/pgstatus" "$muser:$mpass"; then
-      note "minipg $t: HTTP 200 (/minipg/pgstatus)"
+    ip="${t%%:*}"
+    if poll_until "$START_TIMEOUT_MINIPG" minipg_pgstatus_ok "$ip"; then
+      note "minipg $t: jar answers /minipg/pgstatus (200 + pg_ctl body)"
     else
-      err "minipg $t: no HTTP 200 on /minipg/pgstatus after ${START_TIMEOUT_MINIPG}s (want 200 with minipg creds)"
+      err "minipg $t: no jar pgstatus after ${START_TIMEOUT_MINIPG}s (want HTTP 200 + pg_ctl status body from the real minipg jar with minipg creds; body='$(minipg_body "$ip" "/minipg/pgstatus" | redact | head -c 300 || true)')"
       return 1
     fi
   done
@@ -710,11 +985,11 @@ cmd_validate_dependencies() {
   scenario="$(current_scenario)"
   note "validate-dependencies: scenario=$scenario (launch-id=$launch_id)"
 
-  # (a) config identity: expected loopback topology, never prod values.
+  # (a) config identity: pinned bridge topology (ADR-0005), never prod values.
   local pglist
   pglist="$(config_val 'server\.pglist')"
-  [ "$pglist" = "127.0.10.11:5432,127.0.10.12:5433" ] \
-    || { err "unexpected server.pglist='$pglist' (want 127.0.10.11:5432,127.0.10.12:5433)"; return 1; }
+  [ "$pglist" = "$WANT_PGLIST" ] \
+    || { err "unexpected server.pglist='$pglist' (want pinned $WANT_PGLIST)"; return 1; }
   [ "$(config_val 'watcher\.cluster-port')" = "9995" ] \
     || { err "unexpected watcher.cluster-port (want 9995)"; return 1; }
   [ "$(config_val 'watcher\.cluster-pair')" = "no-pair" ] \
@@ -723,7 +998,14 @@ cmd_validate_dependencies() {
     || { err "unexpected minipg.port (want 7779)"; return 1; }
   [ "$(config_val 'server\.address')" = "127.0.0.1" ] \
     || { err "unexpected server.address (want 127.0.0.1 explicit bind)"; return 1; }
-  case "$pglist" in 127.*) ;; *) err "refusing non-loopback pglist: $pglist"; return 1;; esac
+  # ADR-0005 carve-out: BFM itself stays loopback-bound, but server.pglist
+  # lives on the pinned disposable bridge subnet 172.30.51.0/24 (the host
+  # kernel routes the bridge; no published ports). Fail-closed: any pglist
+  # outside the pinned pair is refused here, loopback or not.
+  case "$pglist" in
+    "$WANT_PGLIST") ;;
+    *) err "refusing pglist outside the pinned disposable bridge subnet: $pglist (want $WANT_PGLIST)"; return 1;;
+  esac
   local pguser pgpass muser mpass
   pguser="$(config_val 'server\.pguser')"; pgpass="$(config_val 'server\.pgpassword')"
   muser="$(config_val 'minipg\.username')"; mpass="$(config_val 'minipg\.password')"
@@ -746,6 +1028,35 @@ EOF
     return 1
   fi
   note "seed: $seed matches scenario=$scenario"
+
+  # (a3) staged per-node jar-config identity: both staged configuration.json
+  # files must exist, parse as JSON, and pin the ADR-0005 contract values the
+  # jar requires (clusterManager=bfm, port=7779, vipIp=VIP_IP, bfm/bfm creds,
+  # pgVersion=V14X). PG paths/data layout stay Worker A's and are not pinned
+  # here - only the contract values from the issue are.
+  local minipg_conf
+  for minipg_conf in "$MINIPG_STAGED_CONF_PG1" "$MINIPG_STAGED_CONF_PG2"; do
+    [ -s "$minipg_conf" ] \
+      || { err "staged minipg config $minipg_conf missing/empty (run '$0 prepare $scenario' first)"; return 1; }
+  done
+  if grep -q "@@" "$MINIPG_STAGED_CONF_PG1" "$MINIPG_STAGED_CONF_PG2" 2>/dev/null; then
+    err "staged minipg config contains unsubstituted @@tokens@@ (template/contract drift; re-run '$0 prepare $scenario')"
+    return 1
+  fi
+  if ! python3 - "$MINIPG_STAGED_CONF_PG1" "$MINIPG_STAGED_CONF_PG2" "$VIP_IP" <<'EOF'; then
+import json, sys
+for f in sys.argv[1:3]:
+    c = json.load(open(f))  # raises on corrupt config -> fail
+    assert c.get("clusterManager") == "bfm", (f, c.get("clusterManager"))
+    assert c.get("port") == 7779, (f, c.get("port"))
+    assert c.get("vipIp") == sys.argv[3], (f, c.get("vipIp"))
+    assert c.get("username") == "bfm" and c.get("password") == "bfm", f
+    assert c.get("pgVersion") == "V14X", (f, c.get("pgVersion"))
+EOF
+    err "staged per-node minipg configs fail the ADR-0005 contract check (want clusterManager=bfm, port=7779, vipIp=$VIP_IP, bfm/bfm creds, pgVersion=V14X)"
+    return 1
+  fi
+  note "minipg config: per-node staged configs pin the ADR-0005 contract"
 
   # (b) live PG TCP: bounded polling of every tuple (proxy-free).
   # kill-primary DOWN phase: pg1 must stay DOWN (absence is the point there).
@@ -778,19 +1089,18 @@ EOF
     done
   fi
 
-  # (c) MiniPG HTTP speaks (/minipg/pgstatus with minipg creds, proxy-bypassed).
-  # DOWN phase: pg1's agent goes down with its container (absence is the point);
-  # only pg2's agent must answer 200 there.
+  # (c) MiniPG jar speaks (/minipg/pgstatus with minipg creds, proxy-bypassed):
+  # HTTP 200 plus the jar's real pg_ctl-status body (never agent strings).
+  # DOWN phase: pg1's sidecar goes down with its container (absence is the
+  # point); only pg2's jar must answer there.
   local want_minipg="$MINIPG_TUPLES"
   [ "$phase" = "down" ] && want_minipg="$PG2_IP:$MINIPG_PORT"
-  local code
   for t in $want_minipg; do
-    ip="${t%%:*}"; port="${t##*:}"
-    if poll_until "$VALIDATE_TIMEOUT_MINIPG" http_200 "http://$ip:$port/minipg/pgstatus" "$muser:$mpass"; then
-      note "minipg $t: HTTP 200 (/minipg/pgstatus)"
+    ip="${t%%:*}"
+    if poll_until "$VALIDATE_TIMEOUT_MINIPG" minipg_pgstatus_ok "$ip"; then
+      note "minipg $t: jar answers /minipg/pgstatus (200 + pg_ctl body)"
     else
-      code="$(http_probe "http://$ip:$port/minipg/pgstatus" "$muser:$mpass" || true)"
-      err "minipg $t: HTTP ${code:-000} on /minipg/pgstatus after ${VALIDATE_TIMEOUT_MINIPG}s (minipg agent missing or misconfigured; want 200 with minipg creds)"
+      err "minipg $t: no jar pgstatus after ${VALIDATE_TIMEOUT_MINIPG}s (want HTTP 200 + pg_ctl status body from the real minipg jar with minipg creds; body='$(minipg_body "$ip" "/minipg/pgstatus" | redact | head -c 300 || true)')"
       return 1
     fi
   done
@@ -878,6 +1188,7 @@ EOF
   fi
 
   # -- BFM HTTP: Basic auth with CONFIG creds, proxy bypassed, bounded poll.
+  local code
   poll_until "$VALIDATE_TIMEOUT_BFM_HTTP" http_probe "http://$BFM_IP:$BFM_PORT/bfm/is-alive" "$pguser:$pgpass" || true
   code="$(http_probe "http://$BFM_IP:$BFM_PORT/bfm/is-alive" "$pguser:$pgpass" || true)"
   case "$code" in
@@ -898,69 +1209,69 @@ EOF
   local st_file
   st_file="$(mktemp)"
   if [ "$phase" = "down" ]; then
-    if ! poll_until "$VALIDATE_TIMEOUT_STATE" python3 - "$STATE" "$st_file" "$seed" <<'EOF'
+    if ! poll_until "$VALIDATE_TIMEOUT_STATE" python3 - "$STATE" "$st_file" "$seed" "$PG1_IP:$PG1_PORT" "$PG2_IP:$PG2_PORT" <<'EOF'
 import json, sys
-state, out, seedf = sys.argv[1], sys.argv[2], sys.argv[3]
+state, out, seedf, pg1, pg2 = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 seed = json.load(open(seedf))
 d = json.load(open(state))  # raises on truncated/partial write -> poll retries
 got = {s["address"]: s.get("databaseStatus") for s in d.get("clusterServers", [])}
 promoted = (seed.get("phases") or {}).get("down", {}).get("promoted")
-assert promoted == "127.0.10.12:5433", seed
+assert promoted == pg2, seed
 assert got.get(promoted) == "MASTER", got
-assert got.get("127.0.10.11:5432") not in ("MASTER", "SLAVE"), got
+assert got.get(pg1) not in ("MASTER", "SLAVE"), got
 open(out, "w").write(json.dumps({"clusterStatus": d.get("clusterStatus"), "roles": got}, sort_keys=True))
 EOF
     then
-      err "state check failed after ${VALIDATE_TIMEOUT_STATE}s: fresh state must show 127.0.10.12:5433=MASTER with 127.0.10.11:5432 never MASTER/SLAVE (tolerant of truncated rewrites; see $STATE)"
+      err "state check failed after ${VALIDATE_TIMEOUT_STATE}s: fresh state must show $PG2_IP:$PG2_PORT=MASTER with $PG1_IP:$PG1_PORT never MASTER/SLAVE (tolerant of truncated rewrites; see $STATE)"
       rm -f "$st_file"
       return 1
     fi
     note "state: fresh roles=$(cat "$st_file") (any clusterStatus accepted; HEALTHY is never success evidence here)"
   elif [ "$phase" = "rejoined" ]; then
-    if ! poll_until "$VALIDATE_TIMEOUT_STATE" python3 - "$STATE" "$st_file" "$seed" <<'EOF'
+    if ! poll_until "$VALIDATE_TIMEOUT_STATE" python3 - "$STATE" "$st_file" "$seed" "$PG1_IP:$PG1_PORT" "$PG2_IP:$PG2_PORT" <<'EOF'
 import json, sys
-state, out, seedf = sys.argv[1], sys.argv[2], sys.argv[3]
+state, out, seedf, pg1, pg2 = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 seed = json.load(open(seedf))
 d = json.load(open(state))  # raises on truncated/partial write -> poll retries
 assert d.get("clusterStatus") == "HEALTHY", d.get("clusterStatus")
 got = {s["address"]: s.get("databaseStatus") for s in d.get("clusterServers", [])}
-assert set(got) == {"127.0.10.11:5432", "127.0.10.12:5433"}, got
+assert set(got) == {pg1, pg2}, got
 assert sorted(got.values()) == ["MASTER", "SLAVE"], got
-assert got.get("127.0.10.12:5433") == "MASTER", got
-assert got.get("127.0.10.11:5432") == "SLAVE", got
+assert got.get(pg2) == "MASTER", got
+assert got.get(pg1) == "SLAVE", got
 exp = (seed.get("phases") or {}).get("rejoined", {}).get("roles")
-assert exp == {"127.0.10.12:5433": "MASTER", "127.0.10.11:5432": "SLAVE"}, seed
+assert exp == {pg2: "MASTER", pg1: "SLAVE"}, seed
 assert got == exp, (got, exp)
 open(out, "w").write(json.dumps(got, sort_keys=True))
 EOF
     then
-      err "state check failed after ${VALIDATE_TIMEOUT_STATE}s: want clusterStatus=HEALTHY with 127.0.10.12:5433=MASTER + 127.0.10.11:5432=SLAVE (tolerant of truncated rewrites; see $STATE)"
+      err "state check failed after ${VALIDATE_TIMEOUT_STATE}s: want clusterStatus=HEALTHY with $PG2_IP:$PG2_PORT=MASTER + $PG1_IP:$PG1_PORT=SLAVE (tolerant of truncated rewrites; see $STATE)"
       rm -f "$st_file"
       return 1
     fi
     note "state: HEALTHY rejoined roles=$(cat "$st_file")"
   else
-    if ! poll_until "$VALIDATE_TIMEOUT_STATE" python3 - "$STATE" "$st_file" "$seed" <<'EOF'
+    if ! poll_until "$VALIDATE_TIMEOUT_STATE" python3 - "$STATE" "$st_file" "$seed" "$PG1_IP:$PG1_PORT" "$PG2_IP:$PG2_PORT" <<'EOF'
 import json, sys
-state, out, seedf = sys.argv[1], sys.argv[2], sys.argv[3]
+state, out, seedf, pg1, pg2 = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 seed = json.load(open(seedf))
 d = json.load(open(state))  # raises on truncated/partial write -> poll retries
 assert d.get("clusterStatus") == "HEALTHY", d.get("clusterStatus")
 got = {s["address"]: s.get("databaseStatus") for s in d.get("clusterServers", [])}
-assert set(got) == {"127.0.10.11:5432", "127.0.10.12:5433"}, got
+assert set(got) == {pg1, pg2}, got
 # Exact pin: pg1 MASTER + pg2 SLAVE. The live-SQL path pins pg1 as primary,
 # so set-wise acceptance here would let contradictory evidence green.
-assert got.get("127.0.10.11:5432") == "MASTER", got
-assert got.get("127.0.10.12:5433") == "SLAVE", got
+assert got.get(pg1) == "MASTER", got
+assert got.get(pg2) == "SLAVE", got
 exp = seed.get("roles")
 if exp is None:
     exp = (seed.get("phases") or {}).get("pre-kill", {}).get("roles")
-assert exp == {"127.0.10.11:5432": "MASTER", "127.0.10.12:5433": "SLAVE"}, seed
+assert exp == {pg1: "MASTER", pg2: "SLAVE"}, seed
 assert got == exp, (got, exp)
 open(out, "w").write(json.dumps(got, sort_keys=True))
 EOF
     then
-      err "state check failed after ${VALIDATE_TIMEOUT_STATE}s: want clusterStatus=HEALTHY with 127.0.10.11:5432=MASTER + 127.0.10.12:5433=SLAVE (tolerant of truncated rewrites; see $STATE)"
+      err "state check failed after ${VALIDATE_TIMEOUT_STATE}s: want clusterStatus=HEALTHY with $PG1_IP:$PG1_PORT=MASTER + $PG2_IP:$PG2_PORT=SLAVE (tolerant of truncated rewrites; see $STATE)"
       rm -f "$st_file"
       return 1
     fi
@@ -995,8 +1306,8 @@ EOF
   fi
   if [ "$phase" = "down" ]; then
     for pat in \
-      "Status of 127.0.10.11:5432 is INACCESSIBLE" \
-      "Status of 127.0.10.12:5433 is " \
+      "Status of $PG1_IP:$PG1_PORT is INACCESSIBLE" \
+      "Status of $PG2_IP:$PG2_PORT is " \
       "Cluster Status is " \
       "this is the active bfm pair" \
       "no bfm cluster pair" \
@@ -1019,8 +1330,8 @@ EOF
   else
     for pat in \
       "Cluster Status is " \
-      "Status of 127.0.10.11:5432 is " \
-      "Status of 127.0.10.12:5433 is " \
+      "Status of $PG1_IP:$PG1_PORT is " \
+      "Status of $PG2_IP:$PG2_PORT is " \
       "this is the active bfm pair" \
       "no bfm cluster pair" \
       "VIP Network Check result:" \
@@ -1037,19 +1348,48 @@ EOF
     note "log: checkUnavailable (7s) silent-by-design when no INACCESSIBLE (no rewind line expected; VIP/pgpass prove the loop had opportunity)"
   fi
 
-  # -- VIP holder via the MiniPG agent (fail-closed, live-only proof).
-  # down + rejoined phases: the seed-expected holder's /minipg/checkvip must
-  # name it as holder.
+  # -- VIP proof, read-only via docker exec (issue #23, ADR-0005).
+  # down + rejoined phases only. The seed-expected holder is the VIP address
+  # itself (vipHolder=172.30.51.100): exactly one member container must hold
+  # it (a), that holder must be the live SQL MASTER (b), and a proof write on
+  # the master must flow (c: replica visibility only when a replica is up).
+  # The jar's self-healing VIP route is NEVER consulted here - calling it can
+  # manufacture the inspected state (ADR-0005).
   if [ "$phase" = "down" ] || [ "$phase" = "rejoined" ]; then
     local want_vip
     want_vip="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("vipHolder") or "")' "$seed")"
-    [ "$want_vip" = "$PG2_IP" ] \
-      || { err "seed $seed vipHolder='$want_vip' (want $PG2_IP for phase=$phase; stale fixtures? re-run '$0 prepare $scenario')"; return 1; }
-    if poll_until "$VALIDATE_TIMEOUT_VIP" vip_on "$want_vip"; then
-      note "vip: holder is $want_vip (agent /minipg/checkvip, seed-expected)"
-    else
-      err "vip: $want_vip not the holder after ${VALIDATE_TIMEOUT_VIP}s (agent /minipg/checkvip on $want_vip:$MINIPG_PORT must name $want_vip; body='$(minipg_body "$want_vip" "/minipg/checkvip" | redact || true)')"
+    [ "$want_vip" = "$VIP_IP" ] \
+      || { err "seed $seed vipHolder='$want_vip' (want $VIP_IP for phase=$phase; stale fixtures? re-run '$0 prepare $scenario')"; return 1; }
+    # (a) exactly one holder (bounded poll: the VIP moves during failover).
+    local holder_c=""
+    local vip_end=$((SECONDS + VALIDATE_TIMEOUT_VIP))
+    while (( SECONDS < vip_end )); do
+      if holder_c="$(vip_holder_container 2>/dev/null)"; then break; fi
+      holder_c=""
+      sleep 1
+    done
+    if [ -z "$holder_c" ]; then
+      vip_holder_container || true
+      err "vip: no single holder of $VIP_IP after ${VALIDATE_TIMEOUT_VIP}s (want exactly one member container holding it; inspected via read-only docker exec ip address show)"
       return 1
+    fi
+    local holder_t holder_ip holder_port
+    holder_t="$(holder_pg_tuple "$holder_c")" || return 1
+    holder_ip="${holder_t%%:*}"; holder_port="${holder_t##*:}"
+    note "vip: $VIP_IP held by exactly one member ($holder_c)"
+    # (b) holder == SQL MASTER.
+    [ "$(pg_exec "$holder_ip" "$holder_port" "SELECT pg_is_in_recovery();" || true)" = "f" ] \
+      || { err "vip: holder $holder_c ($holder_t) is not the SQL MASTER (pg_is_in_recovery()!=f on the holder)"; return 1; }
+    note "vip: holder $holder_c ($holder_t) is the SQL MASTER (recovery=f)"
+    # (c) replicated write on the master (replica visibility when one is up).
+    local wtag other_ip other_port
+    wtag="$(printf '%s' "$launch_id" | tr -c 'A-Za-z0-9_.:-' '_')-$phase"
+    if [ "$holder_ip" = "$PG1_IP" ]; then other_ip="$PG2_IP"; other_port="$PG2_PORT";
+    else other_ip="$PG1_IP"; other_port="$PG1_PORT"; fi
+    if [ "$phase" = "rejoined" ]; then
+      vip_write_proof "$holder_ip" "$holder_port" "$other_ip" "$other_port" "$wtag" || return 1
+    else
+      vip_write_proof "$holder_ip" "$holder_port" "-" "-" "$wtag" || return 1
     fi
   fi
 
@@ -1090,18 +1430,29 @@ cmd_status() {
   note "server.pglist=$(config_val 'server\.pglist')"
   note "watcher.cluster-port=$(config_val 'watcher\.cluster-port') watcher.cluster-pair=$(config_val 'watcher\.cluster-pair') minipg.port=$(config_val 'minipg\.port')"
   local t addr port
+  # PG/MiniPG tuples live in container netns on the pinned bridge: the host
+  # ss table cannot see those listeners, so dial each tuple directly (TCP
+  # connect, proxy-free). BFM itself is host-local, so the ss check stands.
   for t in $PG_TUPLES $MINIPG_TUPLES; do
     addr="${t%%:*}"; port="${t##*:}"
-    if tuple_listening "$addr" "$port"; then
-      note "tuple $addr:$port: LISTENING (pid=$(listener_pid "$addr" "$port" || true))"
+    if tcp_probe "$addr" "$port"; then
+      note "tuple $addr:$port: UP (TCP dial OK via bridge $BRIDGE_SUBNET)"
     else
-      note "tuple $addr:$port: free"
+      note "tuple $addr:$port: DOWN/refused"
     fi
   done
   if tuple_listening "$BFM_IP" "$BFM_PORT"; then
     note "tuple $BFM_IP:$BFM_PORT: LISTENING (pid=$(listener_pid "$BFM_IP" "$BFM_PORT" || true))"
   else
     note "tuple $BFM_IP:$BFM_PORT: free"
+  fi
+  [ -s "$MINIPG_STAGED_JAR" ] \
+    && note "minipg jar: staged $MINIPG_STAGED_JAR" \
+    || note "minipg jar: absent (run prepare)"
+  if [ -s "$MINIPG_STAGED_CONF_PG1" ] && [ -s "$MINIPG_STAGED_CONF_PG2" ]; then
+    note "minipg config: staged $MINIPG_STAGED_CONF_PG1 + $MINIPG_STAGED_CONF_PG2"
+  else
+    note "minipg config: absent (run prepare)"
   fi
   if docker_ok; then
     docker ps -a --filter "name=$PG1_CONTAINER" --filter "name=$PG2_CONTAINER" --format 'container {{.Names}}: {{.Status}}' 2>/dev/null || note "containers: (docker ps failed)"
@@ -1276,8 +1627,12 @@ cmd_validate() {
 
 # --- kill-primary / rejoin (kill-primary scenario drivers) ---------------------------
 # kill-primary: docker stop bfm-live-pg1, bounded wait for TCP DOWN (BFM owns
-# the failover: promotes pg2, moves VIP). rejoin: docker start bfm-live-pg1,
-# bounded wait for TCP UP (BFM rejoins it as replica via rewind/rebase).
+# the failover: promotes pg2 and moves the VIP via the real jar). rejoin:
+# docker start bfm-live-pg1, bounded wait for TCP UP (BFM rejoins it as
+# replica via rewind/rebase through the real jar). No shim exists anywhere on
+# this path: server.pglist IPs are the same bridge IPs the jar dials
+# literally (the host->service translation lived in the deleted Python agent,
+# ADR-0005), so DOWN/rejoined detection works on the pinned tuples directly.
 require_kill_scenario() { # require_kill_scenario <op>
   local op="$1" scenario
   scenario="$(current_scenario)"
